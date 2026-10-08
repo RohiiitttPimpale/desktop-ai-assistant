@@ -1,6 +1,20 @@
 import sys
 import os
 import json
+
+# Compatibility shim: PyAV v14+ removed the metadata_errors kwarg that
+# faster-whisper passes to av.open(). Strip it transparently so both old and
+# new PyAV versions work without requiring a downgrade.
+try:
+    import av as _av
+    _orig_av_open = _av.open
+    def _compat_av_open(file, *args, **kwargs):
+        kwargs.pop('metadata_errors', None)
+        return _orig_av_open(file, *args, **kwargs)
+    _av.open = _compat_av_open
+except ImportError:
+    pass  # av not installed; faster_whisper will raise its own error later
+
 from faster_whisper import WhisperModel
 
 def main():

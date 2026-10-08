@@ -8,11 +8,24 @@ def main():
     access_key = os.environ.get('PORCUPINE_ACCESS_KEY', '')
     keyword = os.environ.get('PORCUPINE_KEYWORD', 'hey google')
     
+    if not access_key:
+        print('[wake] MISSING_ACCESS_KEY: Porcupine requires PORCUPINE_ACCESS_KEY. Voice control active via Push-to-Talk (Ctrl+Alt+V) & UI mic button.', flush=True)
+        # Keep process waiting quietly until terminated rather than failing in a crash loop
+        try:
+            while True:
+                import time
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    keyword_path = os.environ.get('PORCUPINE_KEYWORD_FILE', '')
+
     try:
-        if access_key:
-            porcupine = pvporcupine.create(access_key=access_key, keywords=[keyword])
+        if keyword_path and os.path.exists(keyword_path):
+            porcupine = pvporcupine.create(access_key=access_key, keyword_paths=[keyword_path])
         else:
-            porcupine = pvporcupine.create(keywords=[keyword])
+            porcupine = pvporcupine.create(access_key=access_key, keywords=[keyword])
         
         pa = pyaudio.PyAudio()
         audio_stream = pa.open(
@@ -31,7 +44,6 @@ def main():
             result = porcupine.process(pcm)
             if result >= 0:
                 print('[wake] WAKE_WORD_DETECTED', flush=True)
-                break
                 
     except KeyboardInterrupt:
         pass

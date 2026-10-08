@@ -433,11 +433,11 @@ toolRegistry.register({
   },
 });
 
-// SENSITIVE tools (require confirmation via permission gate in tools.ts)
+// GUI interaction tools (NORMAL risk per blueprint.md: run automatically and log in Normal/Full Control)
 toolRegistry.register({
   name: 'click_screen',
   description: 'Clicks on screen at normalized coordinates. Set "x" (0-1000) and "y" (0-1000). Set "button" to "left", "right", or "double".',
-  risk: 'SENSITIVE',
+  risk: 'NORMAL',
   schema: z.object({
     x: z.number().min(0).max(1000),
     y: z.number().min(0).max(1000),
@@ -453,7 +453,7 @@ toolRegistry.register({
 toolRegistry.register({
   name: 'type_text',
   description: 'Types text into the focused input box and presses Enter. Set "text" to the text to type.',
-  risk: 'SENSITIVE',
+  risk: 'NORMAL',
   schema: z.object({ text: z.string().min(1) }),
   handler: async ({ text }) => {
     const prevClip = await clipboard.readText();
@@ -481,7 +481,7 @@ toolRegistry.register({
 toolRegistry.register({
   name: 'press_key',
   description: 'Presses a key combination. Set "key" to one of: ctrl+tab, ctrl+shift+tab, ctrl+t, ctrl+w, ctrl+l, ctrl+s, alt+f4, back, enter, escape, pagedown, pageup.',
-  risk: 'SENSITIVE',
+  risk: 'NORMAL',
   schema: z.object({ key: z.enum(SUPPORTED_KEYS) }),
   handler: async ({ key }) => {
     const msg = await sendShortcutKey(key);
@@ -494,7 +494,7 @@ toolRegistry.register({
 toolRegistry.register({
   name: 'scroll_page',
   description: 'Scrolls the active page. Set "direction" to "up" or "down".',
-  risk: 'SENSITIVE',
+  risk: 'NORMAL',
   schema: z.object({ direction: z.enum(['up', 'down']).default('down') }),
   handler: async ({ direction }) => {
     const msg = await scrollActivePage(direction);

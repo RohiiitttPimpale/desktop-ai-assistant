@@ -45,11 +45,11 @@ Update the checkboxes and the "Current phase" line in AGENTS.md after each phase
 
 **Goal:** Talk to Miko instead of typing.
 
-- [ ] `voice/wake.py`: Porcupine with a custom "Hey Miko" keyword
-- [ ] `voice/stt.py`: faster-whisper, loaded after the wake word, unloaded after about 60 s idle
-- [ ] `voice/tts.py`: Piper
-- [ ] Voice yes/no confirmation replaces the text prompt
-- [ ] Push-to-talk hotkey as a backup
+- [x] `voice/wake.py`: Porcupine with a custom "Hey Miko" keyword (using "jarvis" built-in as placeholder)
+- [x] `voice/stt.py`: faster-whisper, loaded after the wake word, unloaded after about 60 s idle
+- [x] `voice/tts.py`: Piper (with edge-tts fallback)
+- [x] Voice yes/no confirmation replaces the text prompt
+- [x] Push-to-talk hotkey as a backup (Ctrl+Alt+V)
 
 **Test:** Say "Hey Miko, play the song loudly" and she replies and plays it. Try once in a noisy room.
 

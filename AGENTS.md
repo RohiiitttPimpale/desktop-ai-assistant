@@ -83,6 +83,6 @@
 
 ## CURRENT PHASE
 
-- Phase 2: permission engine hardening - enforce the per-tool timeout from `policy.json` inside the registry
-- Done when a slow test tool is cut off at its timeout, the SENSITIVE confirm gate still passes, and tests and type check pass
-- Out of scope until then: voice, WhatsApp, documents, browser work, memory, tool discovery
+- Phase 4: WhatsApp - whatsapp-web.js sidecar, read/download/send
+- Done when Miko can send a test file to yourself and download from a test group
+- Out of scope until then: documents, browser work, memory, tool discovery

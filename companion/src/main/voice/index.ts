@@ -1,6 +1,7 @@
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { dirname, resolve } from 'node:path';
 import { getLogger, logError } from '../logger';
 import { getGlobalStopHotkey } from '../policy';
 import { getOverlay, setFocusable } from '../overlay';
@@ -11,11 +12,46 @@ import { IPC } from '../../shared/ipc';
 
 const execFileAsync = promisify(execFile);
 
-// Script paths - hardcoded relative paths (Python scripts are copied to out/main/scripts/ by build)
-// Export to prevent tree-shaking
-export const _voiceScriptWake = 'scripts/wake.py';
-export const _voiceScriptStt = 'scripts/stt.py';
-export const _voiceScriptPiper = 'scripts/piper-tts.py';
+// Resolve script paths correctly for both dev (esbuild test) and production (Electron)
+function getScriptsDir(): string {
+  try {
+    // Production: use import.meta.url (ESM)
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const metaUrl = (import.meta as unknown as { url?: string }).url;
+    if (metaUrl) {
+      // Handle file:// URL properly: file:///C:/path/on/windows or file:///path/on/linux
+      let path = metaUrl;
+      if (path.startsWith('file://')) {
+        path = path.slice('file://'.length);
+      }
+      // On Windows, file:///C:/... becomes /C:/... after slice, need to remove leading slash
+      if (path.startsWith('/') && path.length >= 3 && path[2] === ':') {
+        path = path.slice(1);
+      }
+      return resolve(dirname(path), 'scripts');
+    }
+  } catch {
+    // ignore
+  }
+  // Dev/test fallback: use __dirname from CommonJS or process.cwd
+  try {
+    // In esbuild bundle, we can use __dirname if available
+    // @ts-ignore - __dirname may not exist in ESM
+    if (typeof __dirname === 'string') {
+      return resolve(__dirname, 'scripts');
+    }
+  } catch {
+    // ignore
+  }
+  // Final fallback: relative to process.cwd()
+  return resolve(process.cwd(), 'src/main/scripts');
+}
+
+const SCRIPTS_DIR = getScriptsDir();
+
+export const _voiceScriptWake = resolve(SCRIPTS_DIR, 'wake.py');
+export const _voiceScriptStt = resolve(SCRIPTS_DIR, 'stt.py');
+export const _voiceScriptPiper = resolve(SCRIPTS_DIR, 'piper-tts.py');
 
 interface WakeWordCallbacks {
   onWake: () => void;
@@ -108,16 +144,21 @@ async function ensureSttModel(): Promise<void> {
       wavHeader.writeUInt32LE(0, 40);
       require('node:fs').writeFileSync(dummyAudio, wavHeader);
 
-      const { stdout } = await execFileAsync('python', [scriptPath, dummyAudio], {
-        timeout: 60000,
+      const result = await execFileAsync('python', [scriptPath, dummyAudio], {
+        timeout: 300000, // 5 minutes for initial model download
         windowsHide: true,
         env: {
           ...process.env,
           WHISPER_MODEL: 'small',
           WHISPER_DEVICE: 'cpu',
           WHISPER_COMPUTE_TYPE: 'int8',
+          HF_HUB_DISABLE_SYMLINKS_WARNING: '1', // Suppress symlink warnings on Windows
         },
       });
+      const stdout = result.stdout;
+      if (result.stderr) {
+        log.warn({ stderr: result.stderr }, 'STT model load stderr');
+      }
 
       require('node:fs').unlinkSync(dummyAudio);
       sttModelLoaded = true;
@@ -175,9 +216,11 @@ export function startVoiceMode(callbacks: VoiceCallbacks): void {
   log.info({ event: 'voice_mode_start' }, 'Starting voice mode');
   
   // Start wake word detection
+  // Using "jarvis" as built-in Porcupine keyword (placeholder for custom "Hey Miko")
+  // To use custom "Hey Miko", train keyword at https://console.picovoice.ai/ and set PORCUPINE_KEYWORD_FILE
   const env = {
     ...process.env,
-    PORCUPINE_KEYWORD: 'hey google',
+    PORCUPINE_KEYWORD: 'jarvis',
   };
 
   wakeProcess = spawn('python', [_voiceScriptWake], {
@@ -187,9 +230,11 @@ export function startVoiceMode(callbacks: VoiceCallbacks): void {
 
   wakeProcess.stdout?.on('data', (data) => {
     const output = data.toString().trim();
-    if (output === '[wake] WAKE_WORD_DETECTED') {
+    if (output.includes('WAKE_WORD_DETECTED')) {
       getLogger().info({ event: 'wake_word' }, 'Wake word detected');
       void handleWakeWord();
+    } else if (output.includes('MISSING_ACCESS_KEY')) {
+      getLogger().info({ event: 'wake_no_key' }, 'Porcupine wake word requires key; Push-to-Talk (Ctrl+Alt+V) active');
     } else if (output.startsWith('[wake]')) {
       getLogger().debug({ output }, 'Wake process output');
     }
@@ -198,7 +243,7 @@ export function startVoiceMode(callbacks: VoiceCallbacks): void {
   wakeProcess.stderr?.on('data', (data) => {
     const error = data.toString().trim();
     if (error) {
-      getLogger().error({ error }, 'Wake process stderr');
+      getLogger().warn({ error }, 'Wake process stderr');
     }
   });
 
@@ -329,35 +374,40 @@ export async function handleRecordingComplete(audioBase64: string): Promise<void
     log.info({ file: audioFile, event: 'stt_transcribe_start' }, 'Transcribing audio...');
     const startTime = Date.now();
 
-    const { stdout } = await execFileAsync('python', [scriptPath, audioFile], {
-      timeout: 60000,
+    const execResult = await execFileAsync('python', [scriptPath, audioFile], {
+      timeout: 120000, // 2 minutes for transcription (model already loaded)
       windowsHide: true,
       env: {
         ...process.env,
         WHISPER_MODEL: 'small',
         WHISPER_DEVICE: 'cpu',
         WHISPER_COMPUTE_TYPE: 'int8',
+        HF_HUB_DISABLE_SYMLINKS_WARNING: '1',
       },
     });
+    const stdout = execResult.stdout;
+    if (execResult.stderr) {
+      log.warn({ stderr: execResult.stderr }, 'STT transcribe stderr');
+    }
 
     const duration = Date.now() - startTime;
-    const result = JSON.parse(stdout.trim());
+    const parsed = JSON.parse(stdout.trim());
 
-    if (result.error) {
-      log.error({ error: result.error, event: 'stt_transcribe_error' }, 'STT transcription failed');
+    if (parsed.error) {
+      log.error({ error: parsed.error, event: 'stt_transcribe_error' }, 'STT transcription failed');
       cb.onError('Could not understand audio');
       return;
     }
 
-    log.info({ text: result.text, language: result.language, durationMs: duration, event: 'stt_transcribe_done' }, `STT: "${result.text}"`);
+    log.info({ text: parsed.text, language: parsed.language, durationMs: duration, event: 'stt_transcribe_done' }, `STT: "${parsed.text}"`);
 
-    if (!result || !result.text) {
+    if (!parsed || !parsed.text) {
       cb.onError('Could not understand audio');
       return;
     }
 
-    log.info({ text: result.text, event: 'transcript' }, `Transcript: "${result.text}"`);
-    cb.onTranscript(result.text);
+    log.info({ text: parsed.text, event: 'transcript' }, `Transcript: "${parsed.text}"`);
+    cb.onTranscript(parsed.text);
   } catch (err) {
     log.error({ error: (err as Error).message, event: 'transcribe_error' }, 'Transcription failed');
     cb.onError(`Transcription failed: ${(err as Error).message}`);
@@ -381,67 +431,59 @@ export async function handleVoiceResponse(text: string): Promise<void> {
   log.info({ text: text.substring(0, 50), event: 'voice_response' }, `Speaking: "${text}"`);
   
   try {
-    const fs = require('node:fs');
-    const path = require('node:path');
-    const os = require('node:os');
-    
-    const outputFile = path.join(os.tmpdir(), `miko-tts-${Date.now()}.wav`);
-    
-    // Piper TTS - use module-level constant
-    const modelPath = process.env['PIPER_MODEL'] || path.join(os.homedir(), '.local', 'share', 'piper', 'en_US-lessac-medium.onnx');
-    
-    let piperSuccess = false;
-    let audio: Uint8Array | null = null;
-    
-    if (fs.existsSync(modelPath)) {
-      try {
-        const scriptPath = _voiceScriptPiper;
-        const { stdout } = await execFileAsync('python', [scriptPath, text, outputFile], {
-          timeout: 30000,
-          windowsHide: true,
-          env: {
-            ...process.env,
-            PIPER_MODEL: modelPath,
-          },
-        });
-        
-        const result = JSON.parse(stdout.trim());
-        if (result.success) {
-          log.info({ text: text.substring(0, 50), outputFile, event: 'piper_tts_done' }, 'Piper TTS synthesized');
-          piperSuccess = true;
-        }
-      } catch (err) {
-        log.error({ error: (err as Error).message, event: 'piper_tts_error' }, 'Piper TTS failed');
-      }
-    } else {
-      log.warn({ modelPath, event: 'piper_model_missing' }, 'Piper model not found, falling back to edge-tts');
-    }
-    
-    if (piperSuccess && fs.existsSync(outputFile)) {
-      const audioBuffer = fs.readFileSync(outputFile);
-      audio = new Uint8Array(audioBuffer);
-      fs.unlinkSync(outputFile);
-    } else {
-      audio = await synthesizeSpeech(text);
-    }
-    
-    voiceCallbacks?.onResponse(text, audio);
+    const audio = await synthesizeSpeech(text);
+    voiceCallbacks.onResponse(text, audio);
   } catch (err) {
     log.error({ error: (err as Error).message, event: 'tts_error' }, 'TTS failed');
-    try {
-      const audio = await synthesizeSpeech(text);
-      voiceCallbacks?.onResponse(text, audio);
-    } catch {
-      voiceCallbacks?.onError('Failed to synthesize speech');
-    }
+    voiceCallbacks.onError('Failed to synthesize speech');
   }
 }
 
 export async function handleVoiceConfirmation(toolName: string, args: Record<string, unknown>): Promise<boolean> {
+  const cb = voiceCallbacks;
+  if (!cb) {
+    // Fallback to dialog if voice callbacks not available
+    return await confirmSensitive(toolName, args);
+  }
+
   const log = getLogger();
   log.info({ tool: toolName, event: 'voice_confirmation' }, `Requesting voice confirmation for ${toolName}`);
-  
-  return await confirmSensitive(toolName, args);
+
+  const argsStr = JSON.stringify(args, null, 2);
+  const prompt = `Miko wants to run ${toolName}. Arguments: ${argsStr}. Say yes to allow or no to cancel.`;
+
+  // Speak the confirmation prompt
+  await handleVoiceResponse(prompt);
+
+  // Wait for user response (yes/no) via voice
+  return new Promise((resolve) => {
+    const originalOnTranscript = cb.onTranscript;
+    const timeout = setTimeout(() => {
+      log.warn({ tool: toolName, event: 'voice_confirmation_timeout' }, 'Voice confirmation timed out');
+      cb.onTranscript = originalOnTranscript;
+      cb.onError('Confirmation timed out');
+      resolve(false);
+    }, 15000);
+
+    // Temporarily override onTranscript to capture yes/no
+    cb.onTranscript = (text: string) => {
+      const lower = text.toLowerCase().trim();
+      if (lower.includes('yes') || lower.includes('yeah') || lower.includes('yep') || lower.includes('sure') || lower.includes('ok') || lower.includes('okay') || lower.includes('allow') || lower.includes('confirm')) {
+        clearTimeout(timeout);
+        cb.onTranscript = originalOnTranscript;
+        log.info({ tool: toolName, event: 'voice_confirmed' }, 'Voice confirmation: ALLOWED');
+        resolve(true);
+      } else if (lower.includes('no') || lower.includes('nope') || lower.includes('cancel') || lower.includes('deny') || lower.includes('stop') || lower.includes('dont') || lower.includes("don't")) {
+        clearTimeout(timeout);
+        cb.onTranscript = originalOnTranscript;
+        log.info({ tool: toolName, event: 'voice_denied' }, 'Voice confirmation: DENIED');
+        resolve(false);
+      } else {
+        // Not a yes/no, forward to original handler
+        originalOnTranscript(text);
+      }
+    };
+  });
 }
 
 function resetSttIdleTimer(): void {

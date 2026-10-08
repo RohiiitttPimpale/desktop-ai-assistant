@@ -1,6 +1,7 @@
 import { toolRegistry, ToolContext, TabSession, TrayMode } from './registry';
 import { getOverlay, setOnTop } from './overlay';
 import { logError } from './logger';
+import { isVoiceModeActive } from './voice';
 import './packs/core';
 
 let maxAgentSteps = 15;
@@ -71,7 +72,12 @@ export async function runTools(
       }
 
       if (needsConfirm) {
-        const confirmed = await (await import('./confirm')).confirmSensitive(action.tool, validated.value);
+        let confirmed: boolean;
+        if (isVoiceModeActive()) {
+          confirmed = await (await import('./voice')).handleVoiceConfirmation(action.tool, validated.value);
+        } else {
+          confirmed = await (await import('./confirm')).confirmSensitive(action.tool, validated.value);
+        }
         if (!confirmed) {
           results.push(`User denied ${action.tool}`);
           continue;
