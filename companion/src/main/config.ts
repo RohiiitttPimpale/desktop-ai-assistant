@@ -14,9 +14,10 @@ export interface Config {
   modelPath: string | null
   size: SizePreset
   position: { x: number; y: number } | null
+  chatPanel: boolean
 }
 
-const defaults: Config = { modelPath: null, size: 'medium', position: null }
+const defaults: Config = { modelPath: null, size: 'medium', position: null, chatPanel: false }
 
 let cache: Config | null = null
 

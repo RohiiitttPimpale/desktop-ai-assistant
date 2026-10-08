@@ -82,10 +82,132 @@
       #chat-input:focus {
         border-color: #a78bfa;
       }
+      :root {
+        --panel-expand: 360px; /* must match CHAT_PANEL_WIDTH in shared/ipc.ts */
+        --panel-w: 340px;
+      }
+      /* With the panel open, the 3D canvas anchors to the right region */
+      body.panel-open canvas {
+        position: fixed;
+        top: 0;
+        right: 0;
+        width: calc(100% - var(--panel-expand));
+        height: 100%;
+      }
+      /* Centered overlay elements must center in the avatar region */
+      body.panel-open #bubble,
+      body.panel-open #hint,
+      body.panel-open #chat-form {
+        left: calc(var(--panel-expand) + (100% - var(--panel-expand)) / 2);
+      }
+      #chat-panel {
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        bottom: 10px;
+        width: var(--panel-w);
+        display: none;
+        flex-direction: column;
+        background: rgba(24, 20, 38, 0.94);
+        border: 1px solid rgba(139, 92, 246, 0.4);
+        border-radius: 14px;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+        color: #f2eefc;
+        font-size: 12.5px;
+        overflow: hidden;
+        user-select: text;
+        -webkit-user-select: text;
+        z-index: 50;
+      }
+      body.panel-open #chat-panel {
+        display: flex;
+      }
+      #chat-panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 12px;
+        border-bottom: 1px solid rgba(139, 92, 246, 0.25);
+        font-weight: 600;
+        flex: 0 0 auto;
+      }
+      #chat-panel-close {
+        background: none;
+        border: none;
+        color: #d8d0ec;
+        font-size: 13px;
+        cursor: pointer;
+        padding: 2px 4px;
+        outline: none;
+      }
+      #chat-panel-close:hover {
+        color: #ef4444;
+      }
+      #chat-messages {
+        flex: 1 1 auto;
+        overflow-y: auto;
+        padding: 10px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      #chat-messages::-webkit-scrollbar {
+        width: 6px;
+      }
+      #chat-messages::-webkit-scrollbar-thumb {
+        background: rgba(139, 92, 246, 0.35);
+        border-radius: 3px;
+      }
+      .cp-msg {
+        display: flex;
+        flex-direction: column;
+        max-width: 88%;
+      }
+      .cp-msg.user {
+        align-self: flex-end;
+        align-items: flex-end;
+      }
+      .cp-msg.miko {
+        align-self: flex-start;
+        align-items: flex-start;
+      }
+      .cp-bubble {
+        padding: 7px 11px;
+        border-radius: 12px;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        word-break: break-word;
+        text-align: left;
+      }
+      .cp-msg.user .cp-bubble {
+        background: rgba(139, 92, 246, 0.32);
+        border: 1px solid rgba(139, 92, 246, 0.5);
+        border-bottom-right-radius: 4px;
+      }
+      .cp-msg.miko .cp-bubble {
+        background: rgba(45, 40, 66, 0.92);
+        border: 1px solid rgba(139, 92, 246, 0.22);
+        border-bottom-left-radius: 4px;
+      }
+      .cp-sub {
+        margin-top: 3px;
+        padding: 0 4px;
+        font-size: 10px;
+        color: #9d94b8;
+        line-height: 1.4;
+        display: -webkit-box;
+        -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
     </style>
   </head>
   <body>
     <canvas id="scene"></canvas>
+    <div id="chat-panel">
+      <div id="chat-panel-header"><span>Miko</span><button id="chat-panel-close" title="Close chat panel">✖</button></div>
+      <div id="chat-messages"></div>
+    </div>
     <div id="bubble" hidden></div>
     <div id="hint" hidden></div>
     <form id="chat-form">

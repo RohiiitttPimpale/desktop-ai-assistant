@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { Avatar } from './avatar'
+import { initChatPanel, addMessage, isPanelOpen } from './chatPanel'
 
 const canvas = document.getElementById('scene') as HTMLCanvasElement
 const hint = document.getElementById('hint') as HTMLDivElement
@@ -14,6 +15,7 @@ style.textContent = `
   .miko-icon-btn { background: rgba(15,23,42,0.85); border: 1px solid #334155; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; color: white; cursor: pointer; backdrop-filter: blur(4px); font-size: 16px; transition: all 0.2s; outline: none; box-shadow: 0 2px 6px rgba(0,0,0,0.4); }
   .miko-icon-btn:hover { background: rgba(30,41,59,0.95); transform: scale(1.05); }
   .miko-icon-btn.listening { background: rgba(239,68,68,0.2); border-color: #ef4444; color: #ef4444; animation: pulse-red 1.5s infinite; }
+  .miko-icon-btn.active { background: rgba(139,92,246,0.45); border-color: #a78bfa; }
   #voice-settings-panel { position: absolute; right: 0; bottom: 100%; margin-bottom: 52px; background: rgba(15,23,42,0.95); border: 1px solid #334155; border-radius: 8px; padding: 12px; backdrop-filter: blur(8px); width: 240px; color: white; font-size: 12px; display: none; flex-direction: column; gap: 10px; z-index: 101; font-family: sans-serif; box-shadow: 0 4px 16px rgba(0,0,0,0.6); }
   #voice-settings-panel.open { display: flex; }
   .vs-row { display: flex; justify-content: space-between; align-items: center; }
@@ -38,8 +40,16 @@ micBtn.className = 'miko-icon-btn'
 micBtn.innerHTML = '🎤'
 micBtn.type = 'button'
 
+const chatBtn = document.createElement('button')
+chatBtn.id = 'chat-btn'
+chatBtn.className = 'miko-icon-btn'
+chatBtn.innerHTML = '💬'
+chatBtn.title = 'Chat panel'
+chatBtn.type = 'button'
+
 controlsContainer.appendChild(gearBtn)
 controlsContainer.appendChild(micBtn)
+controlsContainer.appendChild(chatBtn)
 
 chatForm.style.position = 'relative'
 chatForm.appendChild(controlsContainer)
@@ -56,6 +66,7 @@ settingsPanel.innerHTML = `
     Voice Settings <span id="close-vs" style="cursor:pointer; color:#ef4444; font-size:14px;">✖</span>
   </div>
   <div class="vs-row"><label>Auto-Speak Reply</label><input type="checkbox" id="vs-autospeak" checked></div>
+  <div class="vs-row"><label>Chat Panel</label><input type="checkbox" id="vs-chatpanel"></div>
   <div class="vs-row"><label>Master Volume</label><input type="range" id="vs-volume" min="0" max="1" step="0.1" value="1"></div>
 `
 chatForm.appendChild(settingsPanel)
@@ -70,6 +81,14 @@ gearBtn.onclick = (e) => {
   settingsPanel.classList.toggle('open')
 }
 document.getElementById('close-vs')!.onclick = () => settingsPanel.classList.remove('open')
+
+chatBtn.onclick = (e) => {
+  e.preventDefault()
+  window.companion.setChatPanel(!isPanelOpen())
+}
+document.getElementById('vs-chatpanel')!.addEventListener('change', (e) => {
+  window.companion.setChatPanel((e.target as HTMLInputElement).checked)
+})
 
 // --- Audio Playback ---
 let audioCtx: AudioContext | null = null
@@ -204,6 +223,7 @@ micBtn.onclick = async (e) => {
 // --- Submission Logic ---
 async function submitToBrain(text: string, audioBase64?: string) {
   if (!text && !audioBase64) return
+  if (text) addMessage('user', text)
   chatInput.value = ''
   chatInput.disabled = true
   showBubble('Thinking...', 20000)
@@ -211,8 +231,8 @@ async function submitToBrain(text: string, audioBase64?: string) {
 
   try {
     const reply = await window.companion.askBrain({ text, audioBase64 })
-    const extra = reply.toolResults?.length ? '\n(' + reply.toolResults.join(' -> ') + ')' : ''
-    showBubble(reply.speech + extra, 12000)
+    const extra = reply.toolResults?.length ? reply.toolResults.join(' -> ') : undefined
+    showBubble(reply.speech, 12000, extra)
     avatar.setReaction(reply.emotion, reply.gesture)
     void playVoice(reply.speech, reply.audio)
   } catch (err) {
@@ -248,11 +268,16 @@ renderer.setClearColor(0x000000, 0)
 const avatar = new Avatar()
 
 function resize(): void {
+  // Size to the canvas region: full window when the panel is closed,
+  // the right-hand area when the panel is open (canvas is CSS-anchored there)
+  const w = canvas.clientWidth || window.innerWidth
+  const h = canvas.clientHeight || window.innerHeight
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-  renderer.setSize(window.innerWidth, window.innerHeight, false)
-  avatar.resize(window.innerWidth, window.innerHeight)
+  renderer.setSize(w, h, false)
+  avatar.resize(w, h)
 }
 window.addEventListener('resize', resize)
+new ResizeObserver(() => resize()).observe(canvas)
 resize()
 
 function setHint(text: string | null): void {
@@ -261,9 +286,14 @@ function setHint(text: string | null): void {
 }
 
 let bubbleTimer: ReturnType<typeof setTimeout> | null = null
-function showBubble(text: string, durationMs = 9000): void {
+function showBubble(text: string, durationMs = 9000, sub?: string): void {
+  // Always record into the chat transcript
+  addMessage('miko', text, sub)
+  // With the panel open the transcript shows it; never put text on the avatar
+  if (isPanelOpen()) return
+  const full = sub ? text + '\n(' + sub + ')' : text
   if (bubbleTimer) clearTimeout(bubbleTimer)
-  bubble.textContent = text
+  bubble.textContent = full
   bubble.hidden = false
   bubbleTimer = setTimeout(() => { bubble.hidden = true }, durationMs)
 }
@@ -289,7 +319,7 @@ window.companion.onModelChanged(() => void loadModel())
 window.companion.onCursorMove((nx, ny) => avatar.setLookTarget(nx, ny))
 window.companion.onFocusChat(() => { chatInput.focus(); pointer.dirty = true })
 window.companion.onAgentStep((step) => {
-  showBubble(step.speech + (step.toolResults.length ? '\n(' + step.toolResults.join(', ') + ')' : ''), 15000)
+  showBubble(step.speech, 15000, step.toolResults.join(', ') || undefined)
   avatar.setReaction(step.emotion, step.gesture)
 })
 
@@ -326,6 +356,7 @@ window.companion.onVoiceError((error: string) => {
   chatInput.placeholder = 'Type a message...'
 })
 
+void initChatPanel()
 void loadModel()
 
 const pointer = { x: 0, y: 0, inside: false, dirty: false }
@@ -339,9 +370,17 @@ function isOverChat(): boolean {
   return pointer.x >= r.left - 6 && pointer.x <= r.right + 6 && pointer.y >= r.top - 280 && pointer.y <= r.bottom + 6
 }
 
+function isOverChatPanel(): boolean {
+  if (!pointer.inside || !isPanelOpen()) return false
+  const panel = document.getElementById('chat-panel')
+  if (!panel) return false
+  const r = panel.getBoundingClientRect()
+  return pointer.x >= r.left && pointer.x <= r.right && pointer.y >= r.top && pointer.y <= r.bottom
+}
+
 function isOverAvatar(): boolean {
   if (!pointer.inside) return false
-  if (isOverChat()) return true
+  if (isOverChat() || isOverChatPanel()) return true
   const gl = renderer.getContext()
   const rect = canvas.getBoundingClientRect()
   const x = Math.floor((pointer.x - rect.left) * (canvas.width / rect.width))
@@ -355,7 +394,7 @@ window.addEventListener('mousemove', (e) => { pointer.x = e.clientX; pointer.y =
 document.addEventListener('mouseleave', () => { pointer.inside = false; pointer.dirty = true })
 
 window.addEventListener('mousedown', (e) => {
-  if (e.button !== 0 || !hovering || isOverChat()) return
+  if (e.button !== 0 || !hovering || isOverChat() || isOverChatPanel()) return
   dragging = true
   canvas.style.cursor = 'grabbing'
   window.companion.dragStart()
@@ -369,7 +408,7 @@ window.addEventListener('mouseup', () => {
 })
 window.addEventListener('contextmenu', (e) => {
   e.preventDefault()
-  if (hovering) window.companion.showContextMenu()
+  if (hovering && !isOverChatPanel()) window.companion.showContextMenu()
 })
 
 let last = performance.now()
@@ -387,7 +426,7 @@ function tick(now: number): void {
     const over = isOverAvatar() || document.activeElement === chatInput
     if (!dragging && over !== hovering) {
       hovering = over
-      canvas.style.cursor = over && !isOverChat() ? 'grab' : 'default'
+      canvas.style.cursor = over && !isOverChat() && !isOverChatPanel() ? 'grab' : 'default'
       window.companion.setInteractive(over)
     }
   }

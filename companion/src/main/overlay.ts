@@ -1,9 +1,10 @@
 import { BrowserWindow, screen } from 'electron'
 import { join } from 'node:path'
-import { IPC } from '../shared/ipc'
+import { CHAT_PANEL_WIDTH, IPC } from '../shared/ipc'
 import { SIZES, getConfig, updateConfig, type SizePreset } from './config'
 
 let win: BrowserWindow | null = null
+let chatPanelOpen = false
 let dragTimer: ReturnType<typeof setInterval> | null = null
 let cursorTimer: ReturnType<typeof setInterval> | null = null
 let lastSentX = 999
@@ -22,6 +23,12 @@ function isOnScreen(x: number, y: number, width: number, height: number): boolea
   })
 }
 
+/** Clamp a window x so it does not spill past the left edge of its display. */
+function clampLeft(x: number, y: number, width: number, height: number): number {
+  const area = screen.getDisplayMatching({ x, y, width, height }).workArea
+  return Math.max(area.x, x)
+}
+
 function startCursorTracking(): void {
   if (cursorTimer) clearInterval(cursorTimer)
   cursorTimer = setInterval(() => {
@@ -29,8 +36,10 @@ function startCursorTracking(): void {
     const cursor = screen.getCursorScreenPoint()
     const b = win.getBounds()
 
-    // Anchor at the avatar's head position (center X, 28% down from top of overlay window)
-    const headX = b.x + b.width * 0.5
+    // Anchor at the avatar's head position (center X of the avatar region,
+    // 28% down from top of overlay window). With the chat panel open the
+    // avatar occupies only the right part of the window.
+    const headX = b.x + (chatPanelOpen ? CHAT_PANEL_WIDTH + (b.width - CHAT_PANEL_WIDTH) / 2 : b.width * 0.5)
     const headY = b.y + b.height * 0.28
 
     const nx = Math.max(-1, Math.min(1, (cursor.x - headX) / 700))
@@ -52,13 +61,20 @@ function stopCursorTracking(): void {
 export function createOverlay(): BrowserWindow {
   const cfg = getConfig()
   const { width, height } = SIZES[cfg.size]
+  chatPanelOpen = Boolean(cfg.chatPanel)
+  const windowWidth = chatPanelOpen ? width + CHAT_PANEL_WIDTH : width
   let pos = cfg.position ?? defaultPosition(width, height)
-  if (!isOnScreen(pos.x, pos.y, width, height)) pos = defaultPosition(width, height)
+  if (chatPanelOpen) pos = { x: pos.x - CHAT_PANEL_WIDTH, y: pos.y }
+  if (!isOnScreen(pos.x, pos.y, windowWidth, height)) {
+    pos = defaultPosition(width, height)
+    if (chatPanelOpen) pos = { x: pos.x - CHAT_PANEL_WIDTH, y: pos.y }
+  }
+  if (chatPanelOpen) pos.x = clampLeft(pos.x, pos.y, windowWidth, height)
 
   win = new BrowserWindow({
     x: pos.x,
     y: pos.y,
-    width,
+    width: windowWidth,
     height,
     show: false,
     transparent: true,
@@ -124,6 +140,31 @@ export function setFocusable(focusable: boolean): void {
   }
 }
 
+export function isChatPanelOpen(): boolean {
+  return chatPanelOpen
+}
+
+/**
+ * Opens/closes the chat panel by expanding/shrinking the window on its left
+ * side. The avatar stays at its on-screen position (the window grows left).
+ * The saved config position always stores the avatar-only window anchor.
+ */
+export function setChatPanel(open: boolean): void {
+  if (!win || win.isDestroyed()) return
+  if (open === chatPanelOpen) return
+  if (dragTimer) return // never fight an active drag
+
+  const b = win.getBounds()
+  const nextWidth = open ? b.width + CHAT_PANEL_WIDTH : b.width - CHAT_PANEL_WIDTH
+  const rawX = open ? b.x - CHAT_PANEL_WIDTH : b.x + CHAT_PANEL_WIDTH
+  const x = open ? clampLeft(rawX, b.y, nextWidth, b.height) : rawX
+
+  win.setBounds({ x, y: b.y, width: nextWidth, height: b.height })
+  chatPanelOpen = open
+  updateConfig({ chatPanel: open, position: { x: open ? x + CHAT_PANEL_WIDTH : x, y: b.y } })
+  win.webContents.send(IPC.chatPanelChanged, open)
+}
+
 export function startDrag(): void {
   if (!win || dragTimer) return
   const startCursor = screen.getCursorScreenPoint()
@@ -145,7 +186,8 @@ export function endDrag(): void {
   stopDragTimer()
   if (win) {
     const { x, y } = win.getBounds()
-    updateConfig({ position: { x, y } })
+    // Persist the avatar-only anchor so panel state never shifts the restore position
+    updateConfig({ position: { x: chatPanelOpen ? x + CHAT_PANEL_WIDTH : x, y } })
   }
 }
 
@@ -168,10 +210,14 @@ export function setSize(preset: SizePreset): void {
   if (!win) return
   const old = win.getBounds()
   const { width, height } = SIZES[preset]
-  const x = Math.round(old.x + old.width / 2 - width / 2)
+  // Keep the avatar region centered horizontally, anchored at the bottom
+  const oldAvatarWidth = chatPanelOpen ? old.width - CHAT_PANEL_WIDTH : old.width
+  const avatarCenterX = old.x + (chatPanelOpen ? CHAT_PANEL_WIDTH : 0) + oldAvatarWidth / 2
+  const x = Math.round(avatarCenterX - width / 2 - (chatPanelOpen ? CHAT_PANEL_WIDTH : 0))
   const y = old.y + old.height - height
-  win.setBounds({ x, y, width, height })
-  updateConfig({ size: preset, position: { x, y } })
+  const windowWidth = chatPanelOpen ? width + CHAT_PANEL_WIDTH : width
+  win.setBounds({ x, y, width: windowWidth, height })
+  updateConfig({ size: preset, position: { x: chatPanelOpen ? x + CHAT_PANEL_WIDTH : x, y } })
 }
 
 export function resetPosition(): void {
@@ -179,7 +225,7 @@ export function resetPosition(): void {
   const { width, height } = win.getBounds()
   const { x, y } = defaultPosition(width, height)
   win.setBounds({ x, y, width, height })
-  updateConfig({ position: { x, y } })
+  updateConfig({ position: { x: chatPanelOpen ? x + CHAT_PANEL_WIDTH : x, y } })
 }
 
 export function setOnTop(onTop: boolean): void {

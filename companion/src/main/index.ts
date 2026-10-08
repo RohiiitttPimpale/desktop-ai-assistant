@@ -9,6 +9,8 @@ import {
   endDrag,
   focusChatInput,
   getOverlay,
+  isChatPanelOpen,
+  setChatPanel,
   setFocusable,
   setInteractive,
   showOverlay,
@@ -118,6 +120,10 @@ if (!app.requestSingleInstanceLock()) {
     ipcMain.on(IPC.dragEnd, endDrag)
     ipcMain.on(IPC.contextMenu, showContextMenu)
     ipcMain.handle(IPC.getModel, () => readModel())
+    ipcMain.handle(IPC.chatPanelGet, () => isChatPanelOpen())
+    ipcMain.on(IPC.chatPanelSet, (_e, open: unknown) => {
+      if (typeof open === 'boolean') setChatPanel(open)
+    })
 
     // Voice IPC
     setupVoiceIpc()

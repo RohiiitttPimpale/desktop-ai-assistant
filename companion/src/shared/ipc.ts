@@ -20,7 +20,13 @@ export const IPC = {
   voiceWake: 'voice:wake',
   voiceTranscript: 'voice:transcript',
   voiceError: 'voice:error',
+  chatPanelGet: 'chatPanel:get',
+  chatPanelSet: 'chatPanel:set',
+  chatPanelChanged: 'chatPanel:changed',
 } as const
+
+/** Total window width (px) the chat panel expands the overlay window by on its left side. */
+export const CHAT_PANEL_WIDTH = 360
 
 export interface ModelPayload {
   name: string
@@ -63,4 +69,7 @@ export interface CompanionApi {
   onVoiceStartRecording(callback: () => void): () => void
   startVoiceRecording(): void
   sendVoiceRecordingComplete(audioBase64: string): void
+  getChatPanel(): Promise<boolean>
+  setChatPanel(open: boolean): void
+  onChatPanelChanged(callback: (open: boolean) => void): () => void
 }

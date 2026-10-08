@@ -62,6 +62,13 @@ const api: CompanionApi = {
   },
   startVoiceRecording: () => ipcRenderer.send(IPC.voiceStartRecording),
   sendVoiceRecordingComplete: (audioBase64: string) => ipcRenderer.send(IPC.voiceRecordingComplete, audioBase64),
+  getChatPanel: (): Promise<boolean> => ipcRenderer.invoke(IPC.chatPanelGet) as Promise<boolean>,
+  setChatPanel: (open: boolean) => ipcRenderer.send(IPC.chatPanelSet, open),
+  onChatPanelChanged: (callback: (open: boolean) => void): (() => void) => {
+    const listener = (_e: unknown, open: boolean): void => callback(open)
+    ipcRenderer.on(IPC.chatPanelChanged, listener)
+    return () => ipcRenderer.removeListener(IPC.chatPanelChanged, listener)
+  },
 }
 
 contextBridge.exposeInMainWorld('companion', api)

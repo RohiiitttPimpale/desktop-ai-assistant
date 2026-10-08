@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, Menu, nativeImage, Tray } from 'electron'
 import { exec } from 'node:child_process'
 import path from 'node:path'
 import { getConfig, updateConfig } from './config'
-import { getOverlay, notifyModelChanged, setSize, toggleVisibility } from './overlay'
+import { getOverlay, notifyModelChanged, setSize, toggleVisibility, isChatPanelOpen, setChatPanel } from './overlay'
 import { getMaxAgentSteps, getPermissionLevel, setMaxAgentSteps, setPermissionLevel } from './tools'
 import { startVoiceMode, stopVoiceMode, isVoiceModeActive, defaultVoiceCallbacks } from './voice/index'
 
@@ -112,6 +112,12 @@ export function showContextMenu(): void {
         if (item.checked) startVoiceMode(defaultVoiceCallbacks())
         else stopVoiceMode()
       }
+    },
+    {
+      label: 'Chat Panel',
+      type: 'checkbox',
+      checked: isChatPanelOpen(),
+      click: (item) => setChatPanel(item.checked)
     },
     { type: 'separator' },
     {
