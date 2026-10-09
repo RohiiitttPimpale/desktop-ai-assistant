@@ -1,7 +1,7 @@
 # PENDING_ACTIONS.md — requires user (morning) attention
 
 ## PA-001 — Commit & push tonight's autonomous work
-Status: PENDING
+Status: DONE (pushed 2026-10-09: commits 02d6b87, d1d46ee, 35ce5bd — code, docs/project-memory, config)
 
 ### Required Action
 Commit the overnight changes and push to GitHub.
