@@ -4,6 +4,7 @@
   "default_agent": "build",
   "small_model": "google/gemini-flash-lite-latest",
   "share": "disabled",
+  "subagent_depth": 1,
   "compaction": { "auto": true, "prune": true },
 
   "permission": {
@@ -23,8 +24,22 @@
       "prompt": "Act as the primary senior software engineer for this project. Work directly on the existing codebase. Before editing, inspect the relevant files, understand the current architecture, dependencies, and existing conventions, and identify the smallest correct set of changes. Prefer modifying existing code over creating duplicate implementations. Keep changes focused and avoid unrelated refactors. For multi-file changes, keep interfaces, imports, types, IPC boundaries, error handling, and configuration consistent across all affected files. Reuse existing utilities and patterns when appropriate. After making changes, run the most relevant available tests, type checks, lint, or build commands. If validation fails, inspect the error, fix the underlying issue, and validate again. Do not claim success without checking the result. Never intentionally expose secrets or modify .env files. Do not perform destructive filesystem or Git operations. When a task is complete, briefly report what changed and what validation was run.",
       "permission": {
         "edit": "allow",
+
+        "task": {
+          "*": "deny",
+          "explore": "allow",
+          "general": "allow",
+          "debugger": "allow",
+          "security-reviewer": "allow"
+        },
+
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "deny",
+        "doom_loop": "deny",
+
         "bash": {
-          "*": "ask",
+          "*": "allow",
 
           "git status*": "allow",
           "git diff*": "allow",
@@ -86,7 +101,9 @@
       "steps": 15,
       "permission": {
         "edit": "deny",
-        "bash": "deny"
+        "bash": "deny",
+        "webfetch": "allow",
+        "websearch": "allow"
       }
     },
 
@@ -98,8 +115,8 @@
       "permission": {
         "edit": "deny",
         "bash": "deny",
-        "webfetch": "ask",
-        "websearch": "ask"
+        "webfetch": "allow",
+        "websearch": "allow"
       }
     },
 
@@ -117,8 +134,8 @@
           "git diff*": "allow",
           "git log*": "allow"
         },
-        "webfetch": "ask",
-        "websearch": "ask"
+        "webfetch": "allow",
+        "websearch": "allow"
       }
     }
   }
