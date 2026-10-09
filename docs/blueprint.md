@@ -195,7 +195,7 @@ from enum import IntEnum
 from pydantic import BaseModel
 from litellm import completion
 
-MODEL = "gemini/gemini-2.5-flash"   # check the current model name
+MODEL = "gemini/gemini-3.8-flash"   # current stable Flash (verified Oct 2026; see RESEARCH_NOTES.md)
 FALLBACK = "groq/llama-3.3-70b-versatile"
 
 class Risk(IntEnum):

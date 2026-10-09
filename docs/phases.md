@@ -13,7 +13,7 @@ Update the checkboxes and the "Current phase" line in AGENTS.md after each phase
 
 **Goal:** Prove the brain works before adding voice or apps.
 
-- [ ] `config/settings.json` (`MIKO_VISIBLE`, `DRY_RUN`) - deferred until tools that send/upload exist
+- [x] `config/settings.json` (`MIKO_VISIBLE`, `DRY_RUN`) [`src/main/settings.ts` -> `%APPDATA%/ai-companion/settings.json`; test: tests.ts §18. Consumers arrive with the Phase 4 send tools]
 - [x] Tool registry: decorator, schemas, `schemas()` [`companion/src/main/registry.ts`, zod]
 - [x] LLM provider: Gemini Flash, fallback Groq [`companion/src/main/brain.ts`]
 - [x] Agent loop with step limit and error-to-LLM handling [`companion/src/main/index.ts`, default 15 steps, tray-configurable]
