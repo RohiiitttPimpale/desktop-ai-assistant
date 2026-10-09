@@ -2,12 +2,15 @@ import { app, dialog } from 'electron';
 import { z } from 'zod';
 import fs from 'node:fs';
 import os from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { toolRegistry } from './src/main/registry';
 import './src/main/packs/core';
 import { runTools } from './src/main/tools';
 import { getPolicy, updatePolicy } from './src/main/policy';
 import * as voice from './src/main/voice/index';
-import { createBrain } from './src/main/brain';
+import { createBrain, sanitize } from './src/main/brain';
+import { getSettings, updateSettings, isDryRun, isVisibleMode } from './src/main/settings';
 
 app.whenReady().then(async () => {
   let passed = 0;
@@ -262,6 +265,321 @@ app.whenReady().then(async () => {
         );
       }
       assert(reply.speech === 'Hi from Groq', `Groq reply becomes Miko's speech (got "${reply.speech}")`);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    // 11. Registry-driven action args: schema and sanitizer must derive from
+    // the tool's zod schema (single source of truth), not a hand-maintained list.
+    console.log('\n[11] Checking registry-driven action args...');
+
+    toolRegistry.register({
+      name: 'test_custom_arg_tool',
+      description: 'Test tool with custom args to prove schema/sanitizer stay in sync.',
+      risk: 'READ',
+      schema: z.object({ contact: z.string().min(1), count: z.number() }),
+      handler: async () => {
+        return { success: true, output: 'ok' };
+      },
+    });
+
+    const argTypesForTests = (): Record<string, Record<string, 'string' | 'number'>> => {
+      const out: Record<string, Record<string, 'string' | 'number'>> = {};
+      for (const t of toolRegistry.getAll()) out[t.name] = t.argTypes ?? {};
+      return out;
+    };
+
+    const schema2 = toolRegistry.getSchemaForLLM();
+    const props2 = (schema2.properties as any).actions.items.properties;
+    assert(props2.tool && Array.isArray(props2.tool.enum) && props2.tool.enum.includes('test_custom_arg_tool'), 'LLM schema keeps the tool enum (incl. newly registered tools)');
+    assert(props2.contact !== undefined, 'LLM schema auto-includes a custom "contact" arg');
+    assert(props2.count && props2.count.type === 'NUMBER', 'custom numeric arg is typed NUMBER');
+    assert(props2.name === undefined && props2.target === undefined, 'dead schema entries (name/target) are gone');
+
+    const sanitized = sanitize(
+      {
+        speech: 'ok',
+        emotion: 'happy',
+        gesture: 'none',
+        done: true,
+        actions: [{ tool: 'test_custom_arg_tool', contact: '  tufu panda  ', count: 3, evil: 'should be dropped' }]
+      },
+      toolRegistry.getNames(),
+      argTypesForTests()
+    );
+    assert(sanitized !== null && sanitized.actions.length === 1, 'action with custom args survives sanitize');
+    const sargs = (sanitized?.actions[0]?.args ?? {}) as Record<string, unknown>;
+    assert(sargs.contact === 'tufu panda', 'custom string arg is kept and trimmed');
+    assert(sargs.count === 3, 'custom number arg is kept');
+    assert(!('evil' in sargs), 'unknown arg keys are dropped by sanitize');
+    assert(
+      toolRegistry.validateArgs('test_custom_arg_tool', { contact: 'x', count: 1 }).ok === true,
+      'validateArgs accepts the custom args'
+    );
+
+    assert(sanitize('not an object', toolRegistry.getNames(), argTypesForTests()) === null, 'sanitize returns null for non-object raw');
+    const edgeSan = sanitize(
+      { speech: 'ok', actions: [{ tool: 'no_such_tool', text: 'x' }, { tool: 'type_text', text: 'hello' }] },
+      toolRegistry.getNames(),
+      argTypesForTests()
+    );
+    assert(
+      edgeSan !== null && edgeSan.actions.length === 1 && edgeSan.actions[0].tool === 'type_text',
+      'unknown tools are dropped, known tools kept'
+    );
+    const noActionSan = sanitize({ speech: 'ok' }, toolRegistry.getNames(), argTypesForTests());
+    assert(
+      noActionSan !== null && noActionSan.done === true && noActionSan.actions.length === 0,
+      'reply with no actions defaults done=true'
+    );
+
+    // 12. open_url must only accept http(s) URLs (prompt-injection hardening)
+    console.log('\n[12] Checking open_url scheme restriction...');
+
+    assert(toolRegistry.validateArgs('open_url', { url: 'file:///C:/Windows/System32/cmd.exe' }).ok === false, 'open_url rejects file:// URLs');
+    assert(toolRegistry.validateArgs('open_url', { url: 'ftp://evil.example/x' }).ok === false, 'open_url rejects ftp:// URLs');
+    assert(toolRegistry.validateArgs('open_url', { url: 'javascript:alert(1)' }).ok === false, 'open_url rejects javascript: URLs');
+    assert(toolRegistry.validateArgs('open_url', { url: 'https://example.com' }).ok === true, 'open_url accepts https URLs');
+    assert(toolRegistry.validateArgs('open_url', { url: 'http://localhost:3000/chat' }).ok === true, 'open_url accepts http URLs (local sidecars)');
+
+    // 13. A signal aborted before execution must skip the tool entirely
+    console.log('\n[13] Checking pre-aborted signal handling...');
+
+    const ac2 = new AbortController();
+    ac2.abort();
+    const abortedResult = await toolRegistry.executeWithTimeout('test_sensitive', {}, {
+      trayMode: 'normal',
+      session: { opened: false },
+      abortSignal: ac2.signal,
+    });
+    assert(
+      abortedResult.success === false && (abortedResult.error ?? '').includes('Aborted by user'),
+      `pre-aborted signal skips tool execution (got: ${JSON.stringify(abortedResult)})`
+    );
+    const abortResults = await runTools([{ tool: 'test_sensitive', args: {} }], { opened: false }, ac2.signal);
+    assert(
+      abortResults.some((r) => r.includes('aborted by user')),
+      `runTools short-circuits on a pre-aborted signal without executing anything (got: "${abortResults.join('; ')}")`
+    );
+
+    // 14. Gemini model pool must contain only chat-capable Flash models —
+    // never the Flash-branded image/video/TTS/Live models from the live list.
+    console.log('\n[14] Checking Gemini model pool filtering...');
+
+    const attemptedModels: string[] = [];
+    globalThis.fetch = (async (input: any, _init?: any) => {
+      const url = String(input);
+      if (url.includes(':generateContent')) {
+        attemptedModels.push(url.split('/models/')[1].split(':')[0]);
+        return new Response(
+          '{"candidates":[{"content":{"parts":[{"text":"{\\"speech\\":\\"ok\\",\\"emotion\\":\\"neutral\\",\\"gesture\\":\\"none\\",\\"actions\\":[],\\"done\\":true}"}]}}]}',
+          { status: 200 }
+        );
+      }
+      if (url.includes('generativelanguage.googleapis.com')) {
+        return new Response(
+          JSON.stringify({
+            models: [
+              { name: 'models/gemini-3.8-flash', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-3.1-flash-image', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-omni-1.1-flash', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-3.8-flash-tts', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-3.1-flash-live-preview', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-nano-banana-2.1', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-3.5-flash', supportedGenerationMethods: ['generateContent'] }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof globalThis.fetch;
+
+    try {
+      const poolBrain = createBrain({ apiKey: 'test-key' });
+      const poolReply = await poolBrain.ask('hello');
+      assert(poolReply.speech === 'ok', `brain answers via a chat model (got "${poolReply.speech}")`);
+      assert(attemptedModels.length > 0, `a model was attempted (got ${attemptedModels.length})`);
+      assert(
+        attemptedModels.every((m) => !m.includes('image') && !m.includes('omni') && !m.includes('banana') && !m.includes('tts') && !m.includes('live')),
+        `non-chat flash models are never attempted (attempted: ${attemptedModels.join(', ') || 'none'})`
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    // 15. Groq pool must contain only chat models (whisper/TTS/guard excluded)
+    console.log('\n[15] Checking Groq model pool filtering...');
+
+    const attemptedGroqModels: string[] = [];
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = String(input);
+      if (url.includes(':generateContent')) {
+        return new Response('{"error":{"message":"overloaded"}}', { status: 500 });
+      }
+      if (url.includes('generativelanguage.googleapis.com')) {
+        return new Response('{}', { status: 200 });
+      }
+      if (url.includes('api.groq.com/openai/v1/models')) {
+        return new Response(
+          JSON.stringify({
+            data: [
+              { id: 'llama-3.3-70b-versatile', active: true },
+              { id: 'whisper-large-v3', active: true },
+              { id: 'playai-tts', active: true },
+              { id: 'llama-guard-3-8b', active: true }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes('api.groq.com/openai/v1/chat/completions')) {
+        const body = JSON.parse(String(init?.body));
+        attemptedGroqModels.push(body.model);
+        return new Response(
+          JSON.stringify({
+            choices: [
+              { message: { content: JSON.stringify({ speech: 'Groq chat ok', emotion: 'happy', gesture: 'nod', actions: [], done: true }) } }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof globalThis.fetch;
+
+    try {
+      const groqFilterBrain = createBrain({ apiKey: 'test-key', groqApiKey: 'groq-key' });
+      const groqFilterReply = await groqFilterBrain.ask('hello');
+      assert(groqFilterReply.speech === 'Groq chat ok', `brain answers via a Groq chat model (got "${groqFilterReply.speech}")`);
+      assert(
+        attemptedGroqModels.length > 0 && attemptedGroqModels.every((m) => !m.includes('whisper') && !m.includes('tts') && !m.includes('guard')),
+        `non-chat Groq models are never attempted (attempted: ${attemptedGroqModels.join(', ') || 'none'})`
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    // 16. Shell openers must not be available to the agent (the open_app +
+    // type_text NORMAL-risk composition would otherwise give unconfirmed
+    // command execution).
+    console.log('\n[16] Checking shell openers are blocked...');
+
+    const cmdResult = await toolRegistry.executeWithTimeout('open_app', { app: 'cmd' }, {
+      trayMode: 'normal',
+      session: { opened: false },
+    });
+    assert(
+      cmdResult.success === false && (cmdResult.error ?? '').includes('Blocked app'),
+      `open_app refuses cmd.exe (got: ${JSON.stringify(cmdResult)})`
+    );
+    const wtResult = await toolRegistry.executeWithTimeout('open_app', { app: 'terminal' }, {
+      trayMode: 'normal',
+      session: { opened: false },
+    });
+    assert(wtResult.success === false, 'open_app refuses Windows Terminal');
+    const notepadResult = toolRegistry.validateArgs('open_app', { app: 'notepad' });
+    assert(notepadResult.ok === true, 'open_app still accepts regular apps (notepad)');
+
+    // 17. A tool cut off by its timeout must kill the child processes it
+    // spawned — otherwise the agent is told "failed" while the side effect
+    // still lands afterwards.
+    console.log('\n[17] Checking timed-out tools kill spawned children...');
+
+    const execFileForTests = promisify(execFile);
+    toolRegistry.register({
+      name: 'test_child_tool',
+      description: 'Spawns a long local ping; must be killed by the tool timeout.',
+      risk: 'READ',
+      schema: z.object({}),
+      handler: async (_args, ctx) => {
+        await execFileForTests('ping', ['-n', '30', '127.0.0.1'], {
+          windowsHide: true,
+          signal: ctx.execSignal,
+        });
+        return { success: true, output: 'child finished' };
+      },
+    });
+
+    const savedTimeouts2 = getPolicy().toolTimeouts;
+    updatePolicy({ toolTimeouts: { ...savedTimeouts2, test_child_tool: 150 } });
+    const childStart = Date.now();
+    const childResults = await toolRegistry.executeWithTimeout('test_child_tool', {}, {
+      trayMode: 'normal',
+      session: { opened: false },
+    });
+    const childElapsed = Date.now() - childStart;
+    updatePolicy({ toolTimeouts: savedTimeouts2 });
+
+    assert(
+      childResults.success === false && (childResults.error ?? '').includes('timed out after 150ms'),
+      `child tool is cut off at its timeout (got: ${JSON.stringify(childResults)})`
+    );
+    assert(childElapsed < 2000, `timeout fires promptly (took ${childElapsed}ms, expected about 150ms)`);
+
+    // Give the OS a moment to reap the killed child, then verify none remains.
+    await new Promise((r) => setTimeout(r, 700));
+    const tasklist = await execFileForTests('tasklist', ['/FI', 'IMAGENAME eq PING.EXE'], { windowsHide: true });
+    assert(
+      !tasklist.stdout.toUpperCase().includes('PING.EXE'),
+      'timed-out tool leaves no running child process behind'
+    );
+
+    // 18. Settings infrastructure (MIKO_VISIBLE / DRY_RUN) — Phase 4's send
+    // tools and the phases.md "Final Step" depend on these.
+    console.log('\n[18] Checking settings infrastructure...');
+
+    const savedSettings = { ...getSettings() };
+    assert(isVisibleMode() === savedSettings.MIKO_VISIBLE, 'isVisibleMode reflects stored MIKO_VISIBLE');
+    assert(savedSettings.MIKO_VISIBLE === true, 'MIKO_VISIBLE defaults to true (project rule)');
+
+    updateSettings({ DRY_RUN: true });
+    assert(isDryRun() === true, 'DRY_RUN toggle is readable immediately after update');
+    updateSettings({ DRY_RUN: false, MIKO_VISIBLE: true });
+    assert(isDryRun() === false && isVisibleMode() === true, 'settings restore to defaults');
+
+    // 19. A model whose response never arrives (hung headers) must not stall
+    // the agent — the watchdog moves to the next model and the brain replies.
+    console.log('\n[19] Checking brain watchdog against hung models...');
+
+    const hungAttempts: string[] = [];
+    globalThis.fetch = (async (input: any, _init?: any) => {
+      const url = String(input);
+      if (url.includes(':generateContent')) {
+        const model = url.split('/models/')[1].split(':')[0];
+        hungAttempts.push(model);
+        if (model === 'gemini-3.8-flash') {
+          // Never settles: simulates hung response headers where
+          // AbortSignal.timeout may never fire
+          return new Promise<Response>(() => {});
+        }
+        return new Response(
+          '{"candidates":[{"content":{"parts":[{"text":"{\\"speech\\":\\"recovered\\",\\"emotion\\":\\"happy\\",\\"gesture\\":\\"nod\\",\\"actions\\":[],\\"done\\":true}"}]}}]}',
+          { status: 200 }
+        );
+      }
+      if (url.includes('generativelanguage.googleapis.com')) {
+        return new Response(
+          JSON.stringify({
+            models: [
+              { name: 'models/gemini-3.8-flash', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-3.5-flash', supportedGenerationMethods: ['generateContent'] }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof globalThis.fetch;
+
+    try {
+      const hangBrain = createBrain({ apiKey: 'test-key', timeoutMs: 250 });
+      const hangStart = Date.now();
+      const hangReply = await hangBrain.ask('hello');
+      const hangElapsed = Date.now() - hangStart;
+      assert(hangReply.speech === 'recovered', `brain recovers after a hung model (got "${hangReply.speech}")`);
+      assert(hangElapsed < 5000, `hung model does not stall the agent (took ${hangElapsed}ms, watchdog fires at 250ms)`);
+      assert(hungAttempts.includes('gemini-3.8-flash') && hungAttempts.includes('gemini-3.5-flash'), 'the next model was attempted after the hang');
     } finally {
       globalThis.fetch = realFetch;
     }

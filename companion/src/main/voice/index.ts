@@ -1,7 +1,10 @@
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { dirname, resolve } from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
+import path, { dirname, resolve } from 'node:path';
+import { globalShortcut } from 'electron';
 import { getLogger, logError } from '../logger';
 import { getGlobalStopHotkey } from '../policy';
 import { getOverlay, setFocusable } from '../overlay';
@@ -20,15 +23,15 @@ function getScriptsDir(): string {
     const metaUrl = (import.meta as unknown as { url?: string }).url;
     if (metaUrl) {
       // Handle file:// URL properly: file:///C:/path/on/windows or file:///path/on/linux
-      let path = metaUrl;
-      if (path.startsWith('file://')) {
-        path = path.slice('file://'.length);
+      let rawPath = metaUrl;
+      if (rawPath.startsWith('file://')) {
+        rawPath = rawPath.slice('file://'.length);
       }
       // On Windows, file:///C:/... becomes /C:/... after slice, need to remove leading slash
-      if (path.startsWith('/') && path.length >= 3 && path[2] === ':') {
-        path = path.slice(1);
+      if (rawPath.startsWith('/') && rawPath.length >= 3 && rawPath[2] === ':') {
+        rawPath = rawPath.slice(1);
       }
-      return resolve(dirname(path), 'scripts');
+      return resolve(dirname(rawPath), 'scripts');
     }
   } catch {
     // ignore
@@ -53,11 +56,6 @@ export const _voiceScriptWake = resolve(SCRIPTS_DIR, 'wake.py');
 export const _voiceScriptStt = resolve(SCRIPTS_DIR, 'stt.py');
 export const _voiceScriptPiper = resolve(SCRIPTS_DIR, 'piper-tts.py');
 
-interface WakeWordCallbacks {
-  onWake: () => void;
-  onError: (err: Error) => void;
-}
-
 interface VoiceCallbacks {
   onWake: () => void;
   onTranscript: (text: string) => void;
@@ -67,7 +65,6 @@ interface VoiceCallbacks {
 
 let wakeProcess: ChildProcessWithoutNullStreams | null = null;
 let isListening = false;
-let wakeCallbacks: WakeWordCallbacks | null = null;
 
 let voiceCallbacks: VoiceCallbacks | null = null;
 let isVoiceMode = false;
@@ -124,9 +121,10 @@ async function ensureSttModel(): Promise<void> {
     const log = getLogger();
     log.info({ event: 'stt_load_start' }, 'Loading faster-whisper model...');
 
+    let dummyAudio = '';
     try {
       const scriptPath = _voiceScriptStt;
-      const dummyAudio = require('node:path').join(require('node:os').tmpdir(), 'miko-dummy.wav');
+      dummyAudio = path.join(os.tmpdir(), 'miko-dummy.wav');
 
       const wavHeader = Buffer.alloc(44);
       wavHeader.write('RIFF', 0);
@@ -142,7 +140,7 @@ async function ensureSttModel(): Promise<void> {
       wavHeader.writeUInt16LE(16, 34);
       wavHeader.write('data', 36);
       wavHeader.writeUInt32LE(0, 40);
-      require('node:fs').writeFileSync(dummyAudio, wavHeader);
+      fs.writeFileSync(dummyAudio, wavHeader);
 
       const result = await execFileAsync('python', [scriptPath, dummyAudio], {
         timeout: 300000, // 5 minutes for initial model download
@@ -160,12 +158,20 @@ async function ensureSttModel(): Promise<void> {
         log.warn({ stderr: result.stderr }, 'STT model load stderr');
       }
 
-      require('node:fs').unlinkSync(dummyAudio);
       sttModelLoaded = true;
       log.info({ event: 'stt_load_done' }, 'faster-whisper model loaded');
     } catch (err) {
       log.error({ error: (err as Error).message }, 'Failed to load STT model');
       throw err;
+    } finally {
+      // Always clean the dummy WAV, including on failure (it used to leak)
+      if (dummyAudio) {
+        try {
+          fs.unlinkSync(dummyAudio);
+        } catch {
+          /* file already gone */
+        }
+      }
     }
   })();
 
@@ -250,7 +256,8 @@ export function startVoiceMode(callbacks: VoiceCallbacks): void {
   wakeProcess.on('error', (err) => {
     getLogger().error({ error: err.message }, 'Wake process error');
     isListening = false;
-    wakeCallbacks?.onError(err);
+    // Surface to the installed callbacks so the UI/user actually sees it
+    voiceCallbacks?.onError(`Wake word process failed: ${err.message}`);
   });
 
   wakeProcess.on('exit', (code) => {
@@ -258,14 +265,13 @@ export function startVoiceMode(callbacks: VoiceCallbacks): void {
     isListening = false;
     wakeProcess = null;
     if (code !== 0 && code !== null) {
-      wakeCallbacks?.onError(new Error(`Wake process exited with code ${code}`));
+      voiceCallbacks?.onError('Wake word process exited unexpectedly - Push-to-Talk (Ctrl+Alt+V) still works');
     }
   });
 
   isListening = true;
   
   try {
-    const { globalShortcut } = require('electron');
     globalShortcut.register(PUSH_TO_TALK_HOTKEY, () => {
       if (!isProcessing) {
         handlePushToTalk();
@@ -283,9 +289,8 @@ export function stopVoiceMode(): void {
   isProcessing = false;
   
   stopWakeWord();
-  
+
   try {
-    const { globalShortcut } = require('electron');
     globalShortcut.unregister(PUSH_TO_TALK_HOTKEY);
   } catch {
     // ignore
@@ -359,9 +364,6 @@ export async function handleRecordingComplete(audioBase64: string): Promise<void
   let audioFile = '';
 
   try {
-    const fs = require('node:fs');
-    const path = require('node:path');
-    const os = require('node:os');
     const audioBuffer = Buffer.from(audioBase64, 'base64');
     audioFile = path.join(os.tmpdir(), `miko-stt-${Date.now()}.webm`);
     fs.writeFileSync(audioFile, audioBuffer);
@@ -391,7 +393,16 @@ export async function handleRecordingComplete(audioBase64: string): Promise<void
     }
 
     const duration = Date.now() - startTime;
-    const parsed = JSON.parse(stdout.trim());
+    // stt.py may print library warnings around the JSON line — parse from the
+    // first '{' to the last '}' instead of assuming stdout is pure JSON.
+    const jsonStart = stdout.indexOf('{');
+    const jsonEnd = stdout.lastIndexOf('}');
+    if (jsonStart < 0 || jsonEnd <= jsonStart) {
+      log.error({ stdout: stdout.slice(0, 200), event: 'stt_transcribe_error' }, 'STT produced no JSON output');
+      cb.onError('Could not understand audio');
+      return;
+    }
+    const parsed = JSON.parse(stdout.slice(jsonStart, jsonEnd + 1));
 
     if (parsed.error) {
       log.error({ error: parsed.error, event: 'stt_transcribe_error' }, 'STT transcription failed');
@@ -399,22 +410,24 @@ export async function handleRecordingComplete(audioBase64: string): Promise<void
       return;
     }
 
-    log.info({ text: parsed.text, language: parsed.language, durationMs: duration, event: 'stt_transcribe_done' }, `STT: "${parsed.text}"`);
+    log.info({ text: parsed.text, language: parsed.language, durationMs: duration, event: 'stt_transcribe_done' }, `STT: "${parsed.text.slice(0, 200)}"`);
 
     if (!parsed || !parsed.text) {
       cb.onError('Could not understand audio');
       return;
     }
 
-    log.info({ text: parsed.text, event: 'transcript' }, `Transcript: "${parsed.text}"`);
+    log.info({ text: parsed.text.slice(0, 200), event: 'transcript' }, `Transcript: "${parsed.text.slice(0, 200)}"`);
     cb.onTranscript(parsed.text);
   } catch (err) {
-    log.error({ error: (err as Error).message, event: 'transcribe_error' }, 'Transcription failed');
-    cb.onError(`Transcription failed: ${(err as Error).message}`);
+    const e = err as { message?: string; stderr?: string | Buffer };
+    const stderrDetail = (e.stderr ?? '').toString().slice(0, 300);
+    log.error({ error: e.message, stderr: stderrDetail, event: 'transcribe_error' }, 'Transcription failed');
+    cb.onError(`Transcription failed: ${(e.stderr ?? e.message ?? String(err)).toString().slice(0, 120)}`);
   } finally {
     if (audioFile) {
       try {
-        require('node:fs').unlinkSync(audioFile);
+        fs.unlinkSync(audioFile);
       } catch {
         /* file already gone */
       }
@@ -449,16 +462,44 @@ export async function handleVoiceConfirmation(toolName: string, args: Record<str
   const log = getLogger();
   log.info({ tool: toolName, event: 'voice_confirmation' }, `Requesting voice confirmation for ${toolName}`);
 
+  // Cap the spoken args preview (mirrors confirm.ts) — a long spoken JSON
+  // window is useless and keeps the mic closed longer.
   const argsStr = JSON.stringify(args, null, 2);
-  const prompt = `Miko wants to run ${toolName}. Arguments: ${argsStr}. Say yes to allow or no to cancel.`;
+  const argsPreview = argsStr.length > 400 ? argsStr.slice(0, 400) + '…' : argsStr;
+  // Instruction FIRST, details LAST: the mic opens ~2s after synthesis, so
+  // the prompt's tail is the most likely fragment to be echoed back — it
+  // must not end on a bare allow/deny trigger word.
+  const prompt = `To approve running the tool ${toolName}, say the word yes. To refuse, say no. Details: tool ${toolName} with arguments ${argsPreview}.`;
 
   // Speak the confirmation prompt
   await handleVoiceResponse(prompt);
+
+  // Re-arm the microphone so the user can answer hands-free (same as the
+  // wake-word flow). Delayed so we do not record the tail of the spoken
+  // prompt. Cancelled if the confirmation settles first (e.g. the user
+  // answered via Push-to-Talk) so no stray recording opens afterwards.
+  let rearmTimer: ReturnType<typeof setTimeout> | null = null;
+  const overlay = getOverlay();
+  if (overlay && !overlay.isDestroyed()) {
+    rearmTimer = setTimeout(() => {
+      rearmTimer = null;
+      if (overlay && !overlay.isDestroyed()) {
+        overlay.webContents.send(IPC.voiceStartRecording);
+      }
+    }, 2000);
+  }
+  const cancelRearm = (): void => {
+    if (rearmTimer) {
+      clearTimeout(rearmTimer);
+      rearmTimer = null;
+    }
+  };
 
   // Wait for user response (yes/no) via voice
   return new Promise((resolve) => {
     const originalOnTranscript = cb.onTranscript;
     const timeout = setTimeout(() => {
+      cancelRearm();
       log.warn({ tool: toolName, event: 'voice_confirmation_timeout' }, 'Voice confirmation timed out');
       cb.onTranscript = originalOnTranscript;
       cb.onError('Confirmation timed out');
@@ -468,13 +509,26 @@ export async function handleVoiceConfirmation(toolName: string, args: Record<str
     // Temporarily override onTranscript to capture yes/no
     cb.onTranscript = (text: string) => {
       const lower = text.toLowerCase().trim();
-      if (lower.includes('yes') || lower.includes('yeah') || lower.includes('yep') || lower.includes('sure') || lower.includes('ok') || lower.includes('okay') || lower.includes('allow') || lower.includes('confirm')) {
+      // A confirmation answer is a short phrase of whole words (e.g. "yes",
+      // "yes allow", "no cancel"). Word-boundary matching means innocent
+      // words containing trigger substrings ("broken"→ok, "eyes"→yes) never
+      // match. Anything longer than 3 words is a new command or echoed TTS
+      // audio and must never confirm or deny on its own.
+      const words = lower.split(/[^a-z']+/).filter(Boolean);
+      const isShortAnswer = words.length > 0 && words.length <= 3;
+      const ALLOW_WORDS = new Set(['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'allow', 'confirm']);
+      const DENY_WORDS = new Set(['no', 'nope', 'cancel', 'deny', 'stop', 'dont', "don't"]);
+      const says = (set: Set<string>): boolean => words.some((w) => set.has(w));
+
+      if (isShortAnswer && says(ALLOW_WORDS)) {
         clearTimeout(timeout);
+        cancelRearm();
         cb.onTranscript = originalOnTranscript;
         log.info({ tool: toolName, event: 'voice_confirmed' }, 'Voice confirmation: ALLOWED');
         resolve(true);
-      } else if (lower.includes('no') || lower.includes('nope') || lower.includes('cancel') || lower.includes('deny') || lower.includes('stop') || lower.includes('dont') || lower.includes("don't")) {
+      } else if (isShortAnswer && says(DENY_WORDS)) {
         clearTimeout(timeout);
+        cancelRearm();
         cb.onTranscript = originalOnTranscript;
         log.info({ tool: toolName, event: 'voice_denied' }, 'Voice confirmation: DENIED');
         resolve(false);

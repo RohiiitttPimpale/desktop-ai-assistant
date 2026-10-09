@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, Menu, nativeImage, Tray } from 'electron'
-import { exec } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import path from 'node:path'
 import { getConfig, updateConfig } from './config'
 import { getOverlay, notifyModelChanged, setSize, toggleVisibility, isChatPanelOpen, setChatPanel } from './overlay'
@@ -134,7 +134,9 @@ export function showContextMenu(): void {
           label: 'Custom Type-In...',
           click: () => {
             const psCmd = `Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::InputBox('Enter the exact maximum number of loop steps:', 'Custom Loop Limit', '${getMaxAgentSteps()}')`
-            exec(`powershell -NoProfile -Command "${psCmd}"`, { windowsHide: true }, (err, stdout) => {
+            // execFile with argv (never a shell string) — the only interpolated
+            // value is the numeric step limit.
+            execFile('powershell', ['-NoProfile', '-Command', psCmd], { windowsHide: true }, (err, stdout) => {
               if (stdout) {
                 const val = parseInt(stdout.trim(), 10)
                 if (!isNaN(val) && val > 0) setMaxAgentSteps(val)

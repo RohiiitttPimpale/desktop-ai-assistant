@@ -7,6 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { toolRegistry, ToolContext, TabSession, RiskLevel } from '../../registry';
 import { getOverlay, setOnTop } from '../../overlay';
+import { getForegroundWindowTitle, OVERLAY_TITLE } from '../../foreground';
 
 const execFileAsync = promisify(execFile);
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -16,14 +17,18 @@ const ALLOWED_APPS: Record<string, string> = {
   calc: 'calc.exe',
   calculator: 'calc.exe',
   explorer: 'explorer.exe',
-  cmd: 'cmd.exe',
-  terminal: 'wt.exe',
   taskmgr: 'taskmgr.exe',
   code: 'code',
   chrome: 'chrome',
   edge: 'msedge',
   brave: 'brave',
 };
+// NOTE (security): cmd.exe / Windows Terminal are deliberately NOT openable by
+// the agent. open_app + type_text are both NORMAL-risk (auto-run), so a
+// terminal the agent opened itself would allow unconfirmed shell command
+// execution (AGENTS.md: shell is DANGEROUS-class and must always ask).
+// If a terminal tool is ever needed, add a separate SENSITIVE tool with
+// mandatory confirmation.
 
 function launchDetached(exe: string): void {
   const child = spawn('cmd.exe', ['/c', 'start', '', exe], {
@@ -32,62 +37,6 @@ function launchDetached(exe: string): void {
     windowsHide: true,
   });
   child.unref();
-}
-
-async function getActiveWindowTitle(): Promise<string> {
-  try {
-    const pyWin = [
-      'import ctypes',
-      'u = ctypes.windll.user32',
-      'h = u.GetForegroundWindow()',
-      'b = ctypes.create_unicode_buffer(256)',
-      'u.GetWindowTextW(h, b, 256)',
-      'print(b.value)',
-    ].join('\n');
-    const { stdout } = await execFileAsync('python', ['-c', pyWin], {
-      timeout: 1500,
-      windowsHide: true,
-    });
-    const title = stdout.trim();
-    if (title && title !== 'AI Companion') return title;
-  } catch {
-    /* ignore active window lookup failure */
-  }
-  return '';
-}
-
-async function captureScreenBase64(): Promise<string | null> {
-  const overlay = getOverlay();
-  const wasVisible = Boolean(overlay && !overlay.isDestroyed() && overlay.isVisible());
-
-  if (wasVisible && overlay) {
-    overlay.setOpacity(0);
-    await sleep(90);
-  }
-
-  try {
-    const disp = screen.getPrimaryDisplay();
-    const ratio = disp.size.height / Math.max(disp.size.width, 1);
-    const width = 1280;
-    const height = Math.max(720, Math.round(width * ratio));
-
-    const sources = await desktopCapturer.getSources({
-      types: ['screen'],
-      thumbnailSize: { width, height },
-    });
-
-    if (sources.length > 0 && !sources[0].thumbnail.isEmpty()) {
-      return sources[0].thumbnail.toJPEG(75).toString('base64');
-    }
-    return null;
-  } catch (err) {
-    console.warn('[vision] Screen capture failed:', (err as Error).message);
-    return null;
-  } finally {
-    if (wasVisible && overlay && !overlay.isDestroyed()) {
-      overlay.setOpacity(1);
-    }
-  }
 }
 
 async function captureScreenToFile(filePath: string): Promise<boolean> {
@@ -121,7 +70,7 @@ async function captureScreenToFile(filePath: string): Promise<boolean> {
   }
 }
 
-async function navigateInBrowser(url: string, session: TabSession): Promise<void> {
+async function navigateInBrowser(url: string, session: TabSession, signal?: AbortSignal): Promise<void> {
   if (!session.opened) {
     session.opened = true;
     await shell.openExternal(url);
@@ -157,12 +106,16 @@ async function navigateInBrowser(url: string, session: TabSession): Promise<void
     'u.keybd_event(0x0D, 0, 2, 0)',
   ].join('\n');
 
-  await execFileAsync('python', ['-c', pyNav], { timeout: 3000, windowsHide: true });
-  await sleep(1600);
-  clipboard.writeText(prevClip);
+  try {
+    await execFileAsync('python', ['-c', pyNav], { timeout: 3000, windowsHide: true, signal });
+    await sleep(1600);
+  } finally {
+    // Always restore the user's clipboard, even if navigation failed/timed out
+    clipboard.writeText(prevClip);
+  }
 }
 
-async function clickScreenNormalized(rawX: number, rawY: number, mode: string): Promise<string> {
+async function clickScreenNormalized(rawX: number, rawY: number, mode: string, signal?: AbortSignal): Promise<string> {
   let nx = rawX;
   let ny = rawY;
   if (nx > 0 && nx <= 1 && ny > 0 && ny <= 1) {
@@ -199,12 +152,12 @@ async function clickScreenNormalized(rawX: number, rawY: number, mode: string): 
     '    time.sleep(0.05)',
   ].join('\n');
 
-  await execFileAsync('python', ['-c', pyScript], { timeout: 4000, windowsHide: true });
+  await execFileAsync('python', ['-c', pyScript], { timeout: 4000, windowsHide: true, signal });
   const label = isDouble ? 'Double-clicked' : isRight ? 'Right-clicked' : 'Clicked';
   return `${label} at (${Math.round(nx)}, ${Math.round(ny)})`;
 }
 
-async function sendShortcutKey(rawKey: string): Promise<string> {
+async function sendShortcutKey(rawKey: string, signal?: AbortSignal): Promise<string> {
   const k = rawKey.toLowerCase().trim();
   let codes: number[] | null = null;
 
@@ -239,7 +192,7 @@ async function sendShortcutKey(rawKey: string): Promise<string> {
     '    time.sleep(0.02)',
   ].join('\n');
 
-  await execFileAsync('python', ['-c', pyKey], { timeout: 3000, windowsHide: true });
+  await execFileAsync('python', ['-c', pyKey], { timeout: 3000, windowsHide: true, signal });
   return `Pressed ${k}`;
 }
 
@@ -253,7 +206,7 @@ const SUPPORTED_KEYS = [
   'escape', 'esc', 'enter', 'return',
 ] as const;
 
-async function scrollActivePage(direction: string): Promise<string> {
+async function scrollActivePage(direction: string, signal?: AbortSignal): Promise<string> {
   const isUp = direction.toLowerCase().includes('up');
   const delta = isUp ? 650 : -650;
   const pyScroll = [
@@ -261,11 +214,11 @@ async function scrollActivePage(direction: string): Promise<string> {
     'u = ctypes.windll.user32',
     `u.mouse_event(0x0800, 0, 0, ${delta}, 0)`,
   ].join('\n');
-  await execFileAsync('python', ['-c', pyScroll], { timeout: 3000, windowsHide: true });
+  await execFileAsync('python', ['-c', pyScroll], { timeout: 3000, windowsHide: true, signal });
   return `Scrolled ${isUp ? 'up' : 'down'}`;
 }
 
-async function searchAndOpenYouTube(query: string, session: TabSession): Promise<string> {
+async function searchAndOpenYouTube(query: string, session: TabSession, signal?: AbortSignal): Promise<string> {
   const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
   try {
     const res = await fetch(searchUrl, {
@@ -274,25 +227,25 @@ async function searchAndOpenYouTube(query: string, session: TabSession): Promise
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
       },
-      signal: AbortSignal.timeout(6000),
+      signal: signal ?? AbortSignal.timeout(6000),
     });
     const html = await res.text();
     const match = html.match(/"videoRenderer":\{"videoId":"([a-zA-Z0-9_-]{11})".*?"title":\{"runs":\[\{"text":"([^"]+)"/);
     if (match) {
       const videoId = match[1];
       const title = match[2];
-      await navigateInBrowser(`https://www.youtube.com/watch?v=${videoId}`, session);
+      await navigateInBrowser(`https://www.youtube.com/watch?v=${videoId}`, session, signal);
       return `Playing "${title}" in active tab`;
     }
     const idOnly = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
     if (idOnly) {
-      await navigateInBrowser(`https://www.youtube.com/watch?v=${idOnly[1]}`, session);
+      await navigateInBrowser(`https://www.youtube.com/watch?v=${idOnly[1]}`, session, signal);
       return `Playing YouTube video for "${query}" in active tab`;
     }
   } catch {
     /* fallback to search results page */
   }
-  await navigateInBrowser(searchUrl, session);
+  await navigateInBrowser(searchUrl, session, signal);
   return `Searched YouTube for "${query}" in active tab`;
 }
 
@@ -315,7 +268,7 @@ toolRegistry.register({
   description: 'Returns the current battery percentage.',
   risk: 'READ',
   schema: z.object({}),
-  handler: async () => {
+  handler: async (_args, ctx) => {
     const pyBat = [
       'import ctypes',
       'class SPS(ctypes.Structure):',
@@ -324,7 +277,7 @@ toolRegistry.register({
       'ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s))',
       'print(s.Pct)',
     ].join('\n');
-    const { stdout } = await execFileAsync('python', ['-c', pyBat], { windowsHide: true });
+    const { stdout } = await execFileAsync('python', ['-c', pyBat], { windowsHide: true, signal: ctx?.execSignal });
     const pct = stdout.trim() || 'AC';
     return { success: true, output: `Battery: ${pct}%` };
   },
@@ -350,7 +303,7 @@ toolRegistry.register({
   schema: z.object({ query: z.string().min(1) }),
   handler: async ({ query }, ctx) => {
     const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-    await navigateInBrowser(url, ctx.session);
+    await navigateInBrowser(url, ctx.session, ctx.execSignal);
     return { success: true, output: `Searched Google for "${query}"` };
   },
 });
@@ -361,25 +314,30 @@ toolRegistry.register({
   risk: 'NORMAL',
   schema: z.object({ query: z.string().min(1) }),
   handler: async ({ query }, ctx) => {
-    const msg = await searchAndOpenYouTube(query, ctx.session);
+    const msg = await searchAndOpenYouTube(query, ctx.session, ctx.execSignal);
     return { success: true, output: msg };
   },
 });
 
 toolRegistry.register({
   name: 'open_url',
-  description: 'Navigates to an https:// URL in the active tab. Set "url" to the URL.',
+  description: 'Navigates to an http(s) URL in the active tab. Set "url" to the URL.',
   risk: 'NORMAL',
-  schema: z.object({ url: z.string().url() }),
+  schema: z.object({
+    url: z
+      .string()
+      .url()
+      .refine((v) => /^https?:\/\//i.test(v), { message: 'must be an http(s):// URL' })
+  }),
   handler: async ({ url }, ctx) => {
-    await navigateInBrowser(url, ctx.session);
+    await navigateInBrowser(url, ctx.session, ctx.execSignal);
     return { success: true, output: `Navigated to ${url}` };
   },
 });
 
 toolRegistry.register({
   name: 'open_app',
-  description: 'Opens a desktop app. Set "app" to the app name (notepad, calc, explorer, cmd, terminal, taskmgr, code, chrome, edge, brave).',
+  description: 'Opens a desktop app. Set "app" to the app name (notepad, calc, explorer, taskmgr, code, chrome, edge, brave).',
   risk: 'NORMAL',
   schema: z.object({ app: z.string().min(1) }),
   handler: async ({ app: appName }, ctx) => {
@@ -399,7 +357,7 @@ toolRegistry.register({
   description: 'Adjusts system volume. Set "mode" to "up", "down", or "mute".',
   risk: 'NORMAL',
   schema: z.object({ mode: z.enum(['up', 'down', 'mute']).default('up') }),
-  handler: async ({ mode }) => {
+  handler: async ({ mode }, ctx) => {
     const vk = mode === 'mute' ? 0xad : mode === 'down' ? 0xae : 0xaf;
     const steps = mode === 'mute' ? 1 : 5;
     const pyVol = [
@@ -410,7 +368,7 @@ toolRegistry.register({
       `    u.keybd_event(${vk}, 0, 2, 0)`,
       '    time.sleep(0.02)',
     ].join('\n');
-    await execFileAsync('python', ['-c', pyVol], { windowsHide: true });
+    await execFileAsync('python', ['-c', pyVol], { windowsHide: true, signal: ctx?.execSignal });
     return { success: true, output: `Volume: ${mode}` };
   },
 });
@@ -443,8 +401,8 @@ toolRegistry.register({
     y: z.number().min(0).max(1000),
     button: z.enum(['left', 'right', 'double']).default('left'),
   }),
-  handler: async ({ x, y, button }) => {
-    const msg = await clickScreenNormalized(x, y, button);
+  handler: async ({ x, y, button }, ctx) => {
+    const msg = await clickScreenNormalized(x, y, button, ctx.execSignal);
     await sleep(1000);
     return { success: true, output: msg };
   },
@@ -455,7 +413,18 @@ toolRegistry.register({
   description: 'Types text into the focused input box and presses Enter. Set "text" to the text to type.',
   risk: 'NORMAL',
   schema: z.object({ text: z.string().min(1) }),
-  handler: async ({ text }) => {
+  handler: async ({ text }, ctx) => {
+    // Never type into our own window: if the overlay has focus (the user
+    // clicked Miko's chat input), the paste + Enter would submit the text
+    // to Miko herself.
+    const fg = await getForegroundWindowTitle();
+    if (fg === OVERLAY_TITLE) {
+      return {
+        success: false,
+        output: '',
+        error: "Focused window is Miko's own overlay - refusing to type into myself. Use click_screen to focus the target app first."
+      };
+    }
     const prevClip = await clipboard.readText();
     clipboard.writeText(text);
     const pyPaste = [
@@ -471,9 +440,13 @@ toolRegistry.register({
       'u.keybd_event(0x0D, 0, 0, 0)',
       'u.keybd_event(0x0D, 0, 2, 0)',
     ].join('\n');
-    await execFileAsync('python', ['-c', pyPaste], { timeout: 3000, windowsHide: true });
-    await sleep(1200);
-    clipboard.writeText(prevClip);
+    try {
+      await execFileAsync('python', ['-c', pyPaste], { timeout: 3000, windowsHide: true, signal: ctx.execSignal });
+      await sleep(1200);
+    } finally {
+      // Always restore the user's clipboard, even if the paste failed/timed out
+      clipboard.writeText(prevClip);
+    }
     return { success: true, output: `Typed "${text}"` };
   },
 });
@@ -483,8 +456,18 @@ toolRegistry.register({
   description: 'Presses a key combination. Set "key" to one of: ctrl+tab, ctrl+shift+tab, ctrl+t, ctrl+w, ctrl+l, ctrl+s, alt+f4, back, enter, escape, pagedown, pageup.',
   risk: 'NORMAL',
   schema: z.object({ key: z.enum(SUPPORTED_KEYS) }),
-  handler: async ({ key }) => {
-    const msg = await sendShortcutKey(key);
+  handler: async ({ key }, ctx) => {
+    // Keyboard shortcuts (especially alt+f4) must never be sent to Miko's
+    // own window — that is how she used to close herself and vanish.
+    const fg = await getForegroundWindowTitle();
+    if (fg === OVERLAY_TITLE) {
+      return {
+        success: false,
+        output: '',
+        error: "Focused window is Miko's own overlay - refusing to press keys against myself. Use click_screen to focus the target window first."
+      };
+    }
+    const msg = await sendShortcutKey(key, ctx.execSignal);
     const delay = key.toLowerCase().includes('ctrl+s') ? 2500 : 800;
     await sleep(delay);
     return { success: true, output: msg };
@@ -496,8 +479,8 @@ toolRegistry.register({
   description: 'Scrolls the active page. Set "direction" to "up" or "down".',
   risk: 'NORMAL',
   schema: z.object({ direction: z.enum(['up', 'down']).default('down') }),
-  handler: async ({ direction }) => {
-    const msg = await scrollActivePage(direction);
+  handler: async ({ direction }, ctx) => {
+    const msg = await scrollActivePage(direction, ctx.execSignal);
     await sleep(800);
     return { success: true, output: msg };
   },

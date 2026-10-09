@@ -6,13 +6,31 @@ import { getLogLevel } from './policy';
 
 const LOG_DIR = path.join(app.getPath('userData'), 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'miko.log');
+const LOG_ROTATE_BYTES = 10 * 1024 * 1024;
 
 let loggerInstance: pino.Logger | null = null;
+
+/**
+ * Rotate an oversized log at startup by renaming it (no deletions).
+ * Keeps miko.log from growing without bound across long-running sessions.
+ */
+function rotateLogIfLarge(): void {
+  try {
+    const stat = fs.statSync(LOG_FILE);
+    if (stat.size > LOG_ROTATE_BYTES) {
+      const stamp = new Date().toISOString().slice(0, 10);
+      fs.renameSync(LOG_FILE, path.join(LOG_DIR, `miko-${stamp}-${Date.now()}.log`));
+    }
+  } catch {
+    /* no log file yet, or rename not possible — pino will just recreate/append */
+  }
+}
 
 function createLogger(): pino.Logger {
   if (!fs.existsSync(LOG_DIR)) {
     fs.mkdirSync(LOG_DIR, { recursive: true });
   }
+  rotateLogIfLarge();
 
   const isDev = process.env['NODE_ENV'] === 'development' || process.env['COMPANION_DEVTOOLS'] === '1';
   const logLevel = getLogLevel();
@@ -53,9 +71,18 @@ export interface ToolLogContext {
   needsConfirm: boolean;
 }
 
+/** Cap long string values so logs never capture secrets users typed/pasted. */
+function redactArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    out[k] = typeof v === 'string' && v.length > 120 ? v.slice(0, 120) + '…' : v;
+  }
+  return out;
+}
+
 export function logToolCall(ctx: ToolLogContext): void {
   const log = getLogger();
-  log.info({ ...ctx, event: 'tool_call' }, `Tool call: ${ctx.tool}`);
+  log.info({ ...ctx, args: redactArgs(ctx.args), event: 'tool_call' }, `Tool call: ${ctx.tool}`);
 }
 
 export function logToolResult(tool: string, success: boolean, output: string, error: string | undefined, durationMs: number): void {

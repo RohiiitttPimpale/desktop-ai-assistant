@@ -22,12 +22,11 @@ import {
   getActiveWindowTitle,
   getMaxAgentSteps,
   getPermissionLevel,
-  runTools,
-  setPermissionLevel
+  runTools
 } from './tools'
 import { createTray, showContextMenu } from './tray'
 import { synthesizeSpeech } from './tts'
-import { getGlobalStopHotkey } from './policy'
+import { getGlobalStopHotkey, getPolicy } from './policy'
 import { setupVoiceIpc, handleRecordingComplete, handleVoiceResponse, setVoiceCallbacks, defaultVoiceCallbacks } from './voice/index'
 
 // Import core pack to register tools
@@ -39,18 +38,57 @@ import './voice/index'
 
 let brain: Brain | null = null
 let lastActiveWindow = ''
+// One agent run at a time: concurrent runs would interleave on the shared
+// brain history and the tool session.
+let agentBusy = false
+// Mirrors the renderer's Auto-Speak checkbox; when false, replies skip TTS.
+let autospeakEnabled = true
+
+// Cap renderer-fed audio (~27 MB decoded) so a compromised renderer cannot
+// exhaust memory/disk through the STT temp-file path.
+const MAX_AUDIO_B64_CHARS = 36_000_000
+
+/**
+ * Defense-in-depth: privileged IPC handlers only serve the overlay page.
+ * The window never loads remote content, but if the renderer is ever
+ * compromised, a foreign frame must not be able to drive the agent.
+ */
+function senderIsOverlay(e: { senderFrame?: { url?: string } | null }): boolean {
+  const url = e.senderFrame?.url ?? ''
+  const devUrl = process.env['ELECTRON_RENDERER_URL']
+  return devUrl ? url.startsWith(devUrl) : url.startsWith('file://')
+}
 
 const SAVE_SHOT_RE = /take\s+(a\s+)?screenshot|save\s+(a\s+)?screenshot|screenshot\s+save/i
 const CLICK_RE = /\b(click|double[\s-]*click|right[\s-]*click|press|tap)\b/i
 const VISION_RE =
   /\b(my\s+screen|on\s+screen|look\s+at|see\s+on|what('s|\s+is)\s+(this|on)|read\s+this|explain\s+this|fix\s+this|error|bug|code)\b/i
 
+// Tools that visibly change the screen — only these warrant a fresh screenshot
+// for verification. Info-only tools (battery, system info, volume) leave the
+// screen unchanged, so re-attaching a screenshot would only burn tokens.
+const SCREEN_CHANGING_TOOLS = new Set([
+  'click_screen',
+  'type_text',
+  'press_key',
+  'scroll_page',
+  'open_app',
+  'open_url',
+  'web_search',
+  'play_youtube',
+  'look_at_screen'
+])
+
 function loadApiKey(): string {
-  const viteKey = (import.meta as unknown as { env?: Record<string, string> }).env?.MAIN_VITE_GEMINI_API_KEY
-  const envKey = viteKey || process.env['MAIN_VITE_GEMINI_API_KEY'] || process.env['GEMINI_API_KEY']
+  // Precedence: runtime environment → .env file → build-time substitution (last
+  // resort: electron-vite inlines MAIN_VITE_* at BUILD time, so a release build
+  // made with this variable set would bake the key into the bundle).
+  const envKey = process.env['MAIN_VITE_GEMINI_API_KEY'] || process.env['GEMINI_API_KEY']
   if (envKey && envKey.trim()) return envKey.trim()
 
-  const candidates = [path.join(process.cwd(), '.env'), path.join(app.getAppPath(), '.env')]
+  // App path BEFORE cwd: a stray .env in an unrelated working directory must
+  // not silently substitute a different key.
+  const candidates = [path.join(app.getAppPath(), '.env'), path.join(process.cwd(), '.env')]
 
   for (const envPath of candidates) {
     try {
@@ -67,14 +105,16 @@ function loadApiKey(): string {
       /* ignore read errors */
     }
   }
-  return ''
+
+  const viteKey = (import.meta as unknown as { env?: Record<string, string> }).env?.MAIN_VITE_GEMINI_API_KEY
+  return viteKey && viteKey.trim() ? viteKey.trim() : ''
 }
 
 function loadGroqApiKey(): string | undefined {
-  const viteKey = (import.meta as unknown as { env?: Record<string, string> }).env?.MAIN_VITE_GROQ_API_KEY
-  const envKey = viteKey || process.env['MAIN_VITE_GROQ_API_KEY'] || process.env['GROQ_API_KEY']
+  const envKey = process.env['MAIN_VITE_GROQ_API_KEY'] || process.env['GROQ_API_KEY']
   if (envKey && envKey.trim()) return envKey.trim()
-  return undefined
+  const viteKey = (import.meta as unknown as { env?: Record<string, string> }).env?.MAIN_VITE_GROQ_API_KEY
+  return viteKey && viteKey.trim() ? viteKey.trim() : undefined
 }
 
 function getBrain(): Brain {
@@ -102,11 +142,6 @@ if (!app.requestSingleInstanceLock()) {
   app.on('will-quit', () => globalShortcut.unregisterAll())
 
   app.whenReady().then(() => {
-    ipcMain.on(IPC.setPermission, (_e, level: unknown) => {
-      if (typeof level === 'string' && ['read-only', 'only-browser', 'normal', 'full'].includes(level)) {
-        setPermissionLevel(level as any)
-      }
-    })
     ipcMain.on(IPC.setInteractive, (_e, interactive: unknown) => setInteractive(interactive === true))
     ipcMain.on(IPC.setFocusable, (_e, focusable: unknown) => {
       if (focusable === true) {
@@ -121,8 +156,14 @@ if (!app.requestSingleInstanceLock()) {
     ipcMain.on(IPC.contextMenu, showContextMenu)
     ipcMain.handle(IPC.getModel, () => readModel())
     ipcMain.handle(IPC.chatPanelGet, () => isChatPanelOpen())
-    ipcMain.on(IPC.chatPanelSet, (_e, open: unknown) => {
-      if (typeof open === 'boolean') setChatPanel(open)
+    ipcMain.on(IPC.chatPanelSet, (e, open: unknown) => {
+      if (senderIsOverlay(e) && typeof open === 'boolean') setChatPanel(open)
+    })
+    // Renderer reports its Auto-Speak setting so replies can skip TTS
+    // synthesis entirely (saves ~1-2s latency + API usage per reply) when
+    // the user has it disabled.
+    ipcMain.on(IPC.ttsSetAutospeak, (e, enabled: unknown) => {
+      if (senderIsOverlay(e) && typeof enabled === 'boolean') autospeakEnabled = enabled
     })
 
     // Voice IPC
@@ -134,20 +175,39 @@ if (!app.requestSingleInstanceLock()) {
     setVoiceCallbacks(defaultVoiceCallbacks())
     
     // Voice IPC handlers - registered here to ensure handler functions are included in bundle
-    ipcMain.on('voice:recording-complete', async (_e: Electron.IpcMainEvent, audioBase64: string) => {
+    ipcMain.on(IPC.voiceRecordingComplete, async (e: Electron.IpcMainEvent, audioBase64: string) => {
+      if (!senderIsOverlay(e)) return;
       await handleRecordingComplete(audioBase64);
     });
-    ipcMain.on('voice:response', async (_e: Electron.IpcMainEvent, text: string) => {
+    ipcMain.on(IPC.voiceResponse, async (e: Electron.IpcMainEvent, text: string) => {
+      if (!senderIsOverlay(e)) return;
       await handleVoiceResponse(text);
     });
 
-    ipcMain.handle(IPC.askBrain, async (_e, payload: any) => {
+    ipcMain.handle(IPC.askBrain, async (e, payload: any) => {
+      if (!senderIsOverlay(e)) {
+        return { speech: 'Request rejected.', emotion: 'neutral', gesture: 'none', actions: [], done: true }
+      }
       const prompt = String(payload?.text ?? '').trim()
-      const audioBase64 = payload?.audioBase64 || null
-      
+      const rawAudio = typeof payload?.audioBase64 === 'string' ? payload.audioBase64 : null
+      if (rawAudio && rawAudio.length > MAX_AUDIO_B64_CHARS) {
+        return { speech: 'That recording is too large to process.', emotion: 'neutral', gesture: 'none', actions: [], done: true }
+      }
+      const audioBase64 = rawAudio
+
       if (!prompt && !audioBase64) {
         return { speech: 'Did you want to say something?', emotion: 'neutral', gesture: 'none', actions: [], done: true }
       }
+      if (agentBusy) {
+        return {
+          speech: "I'm still working on your last request - give me a moment!",
+          emotion: 'neutral',
+          gesture: 'think',
+          actions: [],
+          done: true
+        }
+      }
+      agentBusy = true
       try {
         // Reset abort controller for new request
         resetAbortController()
@@ -258,10 +318,22 @@ if (!app.requestSingleInstanceLock()) {
             toolResults: stepResults
           })
 
-          activeWindow = (await getActiveWindowTitle()) || activeWindow
-          imageBase64 = await captureScreenBase64()
-          
-          const prefix = forcedSingle 
+          // Re-read the active window and (only if the last actions could have
+          // changed the screen) grab a fresh screenshot — in parallel. After
+          // info-only steps neither the window nor the screen changed.
+          const affectsScreen = reply.actions.some((a) => SCREEN_CHANGING_TOOLS.has(a.tool))
+          if (affectsScreen) {
+            const [nextTitle, nextShot] = await Promise.all([
+              getActiveWindowTitle(),
+              captureScreenBase64()
+            ])
+            activeWindow = nextTitle || activeWindow
+            imageBase64 = nextShot
+          } else {
+            imageBase64 = null
+          }
+
+          const prefix = forcedSingle
             ? 'WARNING: You attempted multiple actions. I ONLY executed the FIRST one: '
             : 'Previous actions executed: '
 
@@ -274,7 +346,11 @@ if (!app.requestSingleInstanceLock()) {
             prefix +
             '(' +
             stepResults.join('; ') +
-            '). CRITICAL VERIFICATION: Look at the attached screen. Did your action actually succeed? If the UI is still loading or incorrect, call "look_at_screen" to wait. If it is ready, output your NEXT single action. Set "done": false to continue or "done": true if the entire task is complete.'
+            ').' +
+            (imageBase64
+              ? ' CRITICAL VERIFICATION: Look at the attached screen. Did your action actually succeed? If the UI is still loading or incorrect, call "look_at_screen" to wait. If it is ready, output your NEXT single action.'
+              : ' No screenshot is attached for this step. Call "look_at_screen" if you need to see the screen, otherwise output your NEXT single action.') +
+            ' Set "done": false to continue or "done": true if the entire task is complete.'
         }
 
         const chosen = finalReply ?? {
@@ -284,8 +360,12 @@ if (!app.requestSingleInstanceLock()) {
           actions: [],
           done: true
         }
+        // Remember the freshest window title for the next request's fallback
+        if (activeWindow) lastActiveWindow = activeWindow
 
-        const audio = await synthesizeSpeech(chosen.speech)
+        // Skip TTS synthesis entirely when the user disabled auto-speak
+        // (the renderer would discard the audio anyway).
+        const audio = autospeakEnabled ? await synthesizeSpeech(chosen.speech) : null
         return { ...chosen, toolResults: allToolResults, audio }
       } catch (err) {
         return {
@@ -295,11 +375,21 @@ if (!app.requestSingleInstanceLock()) {
           actions: [],
           done: true
         }
+      } finally {
+        agentBusy = false
       }
     })
 
     createOverlay()
     createTray()
+
+    // Observability: a typo in policy.json trustedTools would otherwise
+    // silently disable trust for that tool (important once Phase 4 adds
+    // wa_send_file to the trusted list).
+    const trustedWarnings = getPolicy().trustedTools.filter((t) => !toolRegistry.get(t))
+    if (trustedWarnings.length > 0) {
+      console.warn('[policy] trustedTools entries match no registered tool:', trustedWarnings.join(', '))
+    }
 
     // Global abort controller for emergency stop
     let abortController = new AbortController()

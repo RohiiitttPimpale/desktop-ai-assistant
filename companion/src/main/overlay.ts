@@ -1,4 +1,4 @@
-import { BrowserWindow, screen } from 'electron'
+import { app, BrowserWindow, screen } from 'electron'
 import { join } from 'node:path'
 import { CHAT_PANEL_WIDTH, IPC } from '../shared/ipc'
 import { SIZES, getConfig, updateConfig, type SizePreset } from './config'
@@ -7,6 +7,13 @@ let win: BrowserWindow | null = null
 let chatPanelOpen = false
 let dragTimer: ReturnType<typeof setInterval> | null = null
 let cursorTimer: ReturnType<typeof setInterval> | null = null
+
+// Quit intent: the overlay's close guard lets the app shut down cleanly.
+let quitting = false
+app.on('before-quit', () => {
+  quitting = true
+  if (win && !win.isDestroyed()) win.destroy()
+})
 let lastSentX = 999
 let lastSentY = 999
 
@@ -82,6 +89,10 @@ export function createOverlay(): BrowserWindow {
     frame: false,
     hasShadow: false,
     resizable: false,
+    // Miko must never be closed by keyboard: alt+F4 (sent by her own
+    // press_key tool while the overlay had focus) used to make the avatar
+    // vanish while the app kept running in the tray.
+    closable: false,
     minimizable: false,
     maximizable: false,
     fullscreenable: false,
@@ -99,6 +110,38 @@ export function createOverlay(): BrowserWindow {
   win.setSkipTaskbar(true)
   win.setAlwaysOnTop(true, 'screen-saver')
   win.setIgnoreMouseEvents(true, { forward: true })
+
+  // Second line of defence: any programmatic close just hides the window
+  // unless the whole app is quitting. Miko can lose focus, never herself.
+  win.on('close', (e) => {
+    if (!quitting) {
+      e.preventDefault()
+      win?.hide()
+    }
+  })
+
+  // If the renderer ever crashes (GPU/three.js issues after hours of use),
+  // reload the overlay instead of leaving an invisible dead window.
+  win.webContents.on('render-process-gone', (_e, details) => {
+    console.error('[overlay] Renderer gone:', details.reason, '- reloading overlay')
+    if (!win || win.isDestroyed()) return
+    const devUrl = process.env['ELECTRON_RENDERER_URL']
+    if (devUrl) void win.loadURL(`${devUrl}/overlay/index.html`)
+    else void win.loadFile(join(__dirname, '../renderer/overlay/index.html'))
+  })
+
+  // Security: the overlay must only ever show local app content. Deny all
+  // window.open and block any navigation away from the app (registered after
+  // the initial load so startup navigation is unaffected).
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  win.webContents.once('did-finish-load', () => {
+    win?.webContents.on('will-navigate', (e, url) => {
+      const devUrl = process.env['ELECTRON_RENDERER_URL']
+      const allowed = devUrl ? url.startsWith(devUrl) : url.startsWith('file://')
+      if (!allowed) e.preventDefault()
+    })
+  })
+
   win.once('ready-to-show', () => {
     win?.showInactive()
     startCursorTracking()

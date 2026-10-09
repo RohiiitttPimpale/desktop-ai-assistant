@@ -90,16 +90,21 @@ document.getElementById('vs-chatpanel')!.addEventListener('change', (e) => {
   window.companion.setChatPanel((e.target as HTMLInputElement).checked)
 })
 
+const autospeakInput = document.getElementById('vs-autospeak') as HTMLInputElement | null
+if (autospeakInput) {
+  autospeakInput.addEventListener('change', () => window.companion.setAutospeak(autospeakInput.checked))
+  // Report the initial state so the main process knows from the first reply
+  window.companion.setAutospeak(autospeakInput.checked)
+}
+
 // --- Audio Playback ---
 let audioCtx: AudioContext | null = null
 let analyser: AnalyserNode | null = null
 let gainNode: GainNode | null = null
 let timeData: Uint8Array<ArrayBuffer> | null = null
 let activeSource: AudioBufferSourceNode | null = null
-let speechSafetyTimer: ReturnType<typeof setTimeout> | null = null
 
 function stopAudio(): void {
-  if (speechSafetyTimer) clearTimeout(speechSafetyTimer)
   if (activeSource) {
     try {
       activeSource.stop()
@@ -221,8 +226,15 @@ micBtn.onclick = async (e) => {
 }
 
 // --- Submission Logic ---
+// One agent run at a time. Tracked separately from chatInput.disabled,
+// which is ALSO set during voice recording — conflating the two broke the
+// voice flow (transcripts were dropped because the input looked "busy").
+let agentRunning = false
+
 async function submitToBrain(text: string, audioBase64?: string) {
   if (!text && !audioBase64) return
+  if (agentRunning) return // one agent run at a time
+  agentRunning = true
   if (text) addMessage('user', text)
   chatInput.value = ''
   chatInput.disabled = true
@@ -239,6 +251,7 @@ async function submitToBrain(text: string, audioBase64?: string) {
     showBubble('Error: ' + (err instanceof Error ? err.message : String(err)))
     avatar.setReaction('sad', 'shrug')
   } finally {
+    agentRunning = false
     chatInput.disabled = false
     pointer.dirty = true
     chatInput.focus()
@@ -247,7 +260,7 @@ async function submitToBrain(text: string, audioBase64?: string) {
 
 chatForm.addEventListener('submit', (e) => {
   e.preventDefault()
-  if (!chatInput.disabled) submitToBrain(chatInput.value.trim())
+  if (!chatInput.disabled && !agentRunning) submitToBrain(chatInput.value.trim())
 })
 
 chatInput.addEventListener('keydown', (e) => {
@@ -336,10 +349,13 @@ window.companion.onVoiceStartRecording(() => {
 
 window.companion.onVoiceTranscript((text: string) => {
   chatInput.value = text
-  chatInput.disabled = false
   micBtn.classList.remove('listening')
+  // Recording is done — re-enable the input (it was disabled while
+  // recording). If an agent run is still active, keep the transcript in
+  // the input for the user to send when it finishes.
+  if (agentRunning) return
+  chatInput.disabled = false
   chatInput.placeholder = 'Type a message...'
-  // Auto-submit the transcript
   submitToBrain(text)
 })
 
@@ -414,6 +430,9 @@ window.addEventListener('contextmenu', (e) => {
 let last = performance.now()
 function tick(now: number): void {
   requestAnimationFrame(tick)
+  // backgroundThrottling is disabled, so rAF keeps firing even while the
+  // overlay is hidden (Alt+M / tray) — skip all render work in that case.
+  if (document.hidden) return
   const delta = Math.min((now - last) / 1000, 0.1)
   last = now
 

@@ -17,6 +17,13 @@ export interface ToolContext {
   trayMode: TrayMode;
   session: TabSession;
   abortSignal?: AbortSignal;
+  /**
+   * Aborted when this tool call times out or the user hits the stop hotkey.
+   * Handlers that spawn child processes should pass it as the `signal`
+   * option so the children die with the call instead of landing their side
+   * effects after the agent was told the tool failed.
+   */
+  execSignal?: AbortSignal;
 }
 
 export interface TabSession {
@@ -29,6 +36,10 @@ export interface ToolDef<Args extends z.ZodTypeAny = z.ZodTypeAny> {
   risk: RiskLevel;
   schema: Args;
   handler: (args: z.infer<Args>, ctx: ToolContext) => Promise<ToolResult>;
+  /** Derived from the zod schema at registration — single source of truth for LLM-visible arg names. */
+  argNames?: string[];
+  /** Arg name -> JSON type for the LLM schema (ZodNumber => NUMBER, else STRING). */
+  argTypes?: Record<string, 'string' | 'number'>;
 }
 
 const RISK_ORDER: Record<RiskLevel, number> = {
@@ -54,7 +65,18 @@ export class ToolRegistry {
     if (this.tools.has(def.name)) {
       throw new Error(`Tool "${def.name}" already registered`);
     }
-    this.tools.set(def.name, def as unknown as ToolDef<z.ZodTypeAny>);
+    // Derive arg names/types once from the zod schema so the LLM schema and
+    // brain.sanitize never drift from the actual validation rules.
+    const argTypes: Record<string, 'string' | 'number'> = {};
+    if (def.schema instanceof z.ZodObject) {
+      for (const [key, type] of Object.entries(def.schema.shape)) {
+        argTypes[key] = type instanceof z.ZodNumber ? 'number' : 'string';
+      }
+    }
+    this.tools.set(
+      def.name,
+      { ...def, argNames: Object.keys(argTypes), argTypes } as unknown as ToolDef<z.ZodTypeAny>
+    );
   }
 
   get(name: string): ToolDef | undefined {
@@ -78,26 +100,19 @@ export class ToolRegistry {
     };
 
     if (this.tools.size > 0) {
-      const toolNames = this.getNames();
+      const argProps: Record<string, unknown> = {
+        tool: { type: 'STRING', enum: this.getNames() },
+      };
+      for (const tool of this.tools.values()) {
+        for (const [key, type] of Object.entries(tool.argTypes ?? {})) {
+          if (key !== 'tool') argProps[key] ??= { type: type === 'number' ? 'NUMBER' : 'STRING' };
+        }
+      }
       properties.actions = {
         type: 'ARRAY',
         items: {
           type: 'OBJECT',
-          properties: {
-            tool: { type: 'STRING', enum: toolNames },
-            name: { type: 'STRING' },
-            query: { type: 'STRING' },
-            text: { type: 'STRING' },
-            key: { type: 'STRING' },
-            url: { type: 'STRING' },
-            x: { type: 'NUMBER' },
-            y: { type: 'NUMBER' },
-            mode: { type: 'STRING' },
-            app: { type: 'STRING' },
-            target: { type: 'STRING' },
-            button: { type: 'STRING' },
-            direction: { type: 'STRING' },
-          },
+          properties: argProps,
           required: ['tool'],
         },
       };
@@ -115,10 +130,12 @@ export class ToolRegistry {
   checkPermission(toolName: string, trayMode: TrayMode): { allowed: boolean; needsConfirm: boolean } {
     const tool = this.tools.get(toolName);
     if (!tool) {
+      logPermissionCheck(toolName, trayMode, false, false, false);
       return { allowed: false, needsConfirm: false };
     }
 
     if (trayMode === 'only-browser' && !BROWSER_TOOLS.has(toolName)) {
+      logPermissionCheck(toolName, trayMode, false, false, false);
       return { allowed: false, needsConfirm: false };
     }
 
@@ -127,6 +144,7 @@ export class ToolRegistry {
     const maxRiskLevel = RISK_ORDER[maxRisk];
 
     if (toolRiskLevel > maxRiskLevel) {
+      logPermissionCheck(toolName, trayMode, false, false, false);
       return { allowed: false, needsConfirm: false };
     }
 
@@ -184,21 +202,38 @@ export class ToolRegistry {
       needsConfirm: tool.risk === 'SENSITIVE' || tool.risk === 'DANGEROUS',
     });
 
-    // Per-tool timeout from policy.json (default 30s)
+    // Emergency stop (Ctrl+Alt+X) already fired: never start the handler.
+    // (An abort listener attached after the signal fired would never trigger.)
+    if (ctx.abortSignal?.aborted) {
+      logToolResult(toolName, false, '', 'Aborted by user', 0);
+      return { success: false, output: '', error: 'Aborted by user (Ctrl+Alt+X)' };
+    }
+
+    // Per-tool timeout from policy.json (default 30s). The same controller
+    // also kills any child processes the handler spawned (via ctx.execSignal).
+    const execController = new AbortController();
+    const handlerCtx: ToolContext = { ...ctx, execSignal: execController.signal };
+
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs);
+      timer = setTimeout(() => {
+        execController.abort();
+        reject(new Error(`timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
     });
 
     // Emergency stop (Ctrl+Alt+X)
     let abortHandler: (() => void) | undefined;
     const abortPromise = new Promise<never>((_resolve, reject) => {
       if (!ctx.abortSignal) return;
-      abortHandler = () => reject(new Error('Aborted by user'));
+      abortHandler = () => {
+        execController.abort();
+        reject(new Error('Aborted by user'));
+      };
       ctx.abortSignal.addEventListener('abort', abortHandler, { once: true });
     });
 
-    const execPromise = tool.handler(args, ctx);
+    const execPromise = tool.handler(args, handlerCtx);
     // If the timeout wins the race, a late handler rejection must not become
     // an unhandled rejection - mark it handled without touching the race.
     execPromise.catch(() => undefined);

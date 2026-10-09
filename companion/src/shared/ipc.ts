@@ -12,8 +12,6 @@ export const IPC = {
   cursorMove: 'overlay:cursor-move',
   focusChat: 'overlay:focus-chat',
   agentStep: 'brain:agent-step',
-  setPermission: 'config:set-permission',
-  permissionChanged: 'config:permission-changed',
   voiceStartRecording: 'voice:start-recording',
   voiceRecordingComplete: 'voice:recording-complete',
   voiceResponse: 'voice:response',
@@ -23,6 +21,7 @@ export const IPC = {
   chatPanelGet: 'chatPanel:get',
   chatPanelSet: 'chatPanel:set',
   chatPanelChanged: 'chatPanel:changed',
+  ttsSetAutospeak: 'tts:set-autospeak',
 } as const
 
 /** Total window width (px) the chat panel expands the overlay window by on its left side. */
@@ -46,8 +45,6 @@ export type BrainResponsePayload = BrainReply & {
   audio?: Uint8Array | null
 }
 
-export type PermissionLevel = 'read-only' | 'only-browser' | 'normal' | 'full'
-
 export interface CompanionApi {
   setInteractive(interactive: boolean): void
   setFocusable(focusable: boolean): void
@@ -59,8 +56,6 @@ export interface CompanionApi {
   onCursorMove(callback: (nx: number, ny: number) => void): () => void
   onFocusChat(callback: () => void): () => void
   onAgentStep(callback: (payload: AgentStepPayload) => void): () => void
-  setPermission(level: PermissionLevel): void
-  onPermissionChanged(callback: (level: PermissionLevel) => void): () => void
   askBrain(payload: { text: string; audioBase64?: string }): Promise<BrainResponsePayload>
   onVoiceWake(callback: () => void): () => void
   onVoiceTranscript(callback: (text: string) => void): () => void
@@ -72,4 +67,5 @@ export interface CompanionApi {
   getChatPanel(): Promise<boolean>
   setChatPanel(open: boolean): void
   onChatPanelChanged(callback: (open: boolean) => void): () => void
+  setAutospeak(enabled: boolean): void
 }

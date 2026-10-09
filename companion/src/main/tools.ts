@@ -1,5 +1,4 @@
 import { toolRegistry, ToolContext, TabSession, TrayMode } from './registry';
-import { getOverlay, setOnTop } from './overlay';
 import { logError } from './logger';
 import { isVoiceModeActive } from './voice';
 import './packs/core';
@@ -12,11 +11,10 @@ export type PermissionLevel = 'read-only' | 'only-browser' | 'normal' | 'full';
 let currentPermission: PermissionLevel = 'normal';
 
 export function setPermissionLevel(level: PermissionLevel): void {
+  // Permission level is changed ONLY from the tray (the user's privileged
+  // control surface). The old renderer IPC channel was removed: a compromised
+  // renderer must never be able to escalate to full control by itself.
   currentPermission = level;
-  const win = getOverlay();
-  if (win && !win.isDestroyed()) {
-    win.webContents.send('config:permission-changed', level);
-  }
 }
 export function getPermissionLevel(): PermissionLevel {
   return currentPermission;
@@ -84,7 +82,6 @@ export async function runTools(
         }
       }
 
-      console.log('[tools] Executing action:', JSON.stringify(action));
       const ctx: ToolContext = { trayMode, session, abortSignal };
       const result = await toolRegistry.executeWithTimeout(action.tool, validated.value, ctx);
 
@@ -102,28 +99,10 @@ export async function runTools(
 }
 
 export async function getActiveWindowTitle(): Promise<string> {
-  const { execFile } = await import('node:child_process');
-  const { promisify } = await import('node:util');
-  const execFileAsync = promisify(execFile);
-  try {
-    const pyWin = [
-      'import ctypes',
-      'u = ctypes.windll.user32',
-      'h = u.GetForegroundWindow()',
-      'b = ctypes.create_unicode_buffer(256)',
-      'u.GetWindowTextW(h, b, 256)',
-      'print(b.value)',
-    ].join('\n');
-    const { stdout } = await execFileAsync('python', ['-c', pyWin], {
-      timeout: 1500,
-      windowsHide: true,
-    });
-    const title = stdout.trim();
-    if (title && title !== 'AI Companion') return title;
-  } catch {
-    /* ignore active window lookup failure */
-  }
-  return '';
+  const { getForegroundWindowTitle, OVERLAY_TITLE } = await import('./foreground')
+  const title = await getForegroundWindowTitle()
+  if (title && title !== OVERLAY_TITLE) return title
+  return ''
 }
 
 export async function captureScreenBase64(): Promise<string | null> {

@@ -45,6 +45,9 @@ export class Avatar {
 
   private bounds = new THREE.Box3(new THREE.Vector3(-0.5, 0, -0.3), new THREE.Vector3(0.5, 1.7, 0.3))
 
+  // Reused scratch vector: avoids a new Vector3 allocation every frame (GC pressure)
+  private readonly scratchHeadPos = new THREE.Vector3()
+
   constructor() {
     const key = new THREE.DirectionalLight(0xffffff, Math.PI)
     key.position.set(0.8, 1, 1).normalize()
@@ -173,7 +176,7 @@ export class Avatar {
         head.rotation.z += (targetHeadZ - head.rotation.z) * headLerp
 
         // Update 3D eye lookAt target in front of the head
-        const headPos = new THREE.Vector3()
+        const headPos = this.scratchHeadPos.set(0, 0, 0)
         head.getWorldPosition(headPos)
         this.lookAtTarget.position.set(
           headPos.x + this.currentLookX * 0.7,

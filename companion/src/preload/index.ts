@@ -33,12 +33,6 @@ const api: CompanionApi = {
     ipcRenderer.on(IPC.agentStep, listener)
     return () => ipcRenderer.removeListener(IPC.agentStep, listener)
   },
-  setPermission: (level) => ipcRenderer.send(IPC.setPermission, level),
-  onPermissionChanged: (callback) => {
-    const listener = (_e: unknown, level: string): void => callback(level as any)
-    ipcRenderer.on(IPC.permissionChanged, listener)
-    return () => ipcRenderer.removeListener(IPC.permissionChanged, listener)
-  },
   askBrain: (payload) => ipcRenderer.invoke(IPC.askBrain, payload),
   onVoiceWake: (callback) => {
     const listener = (): void => callback()
@@ -69,6 +63,7 @@ const api: CompanionApi = {
     ipcRenderer.on(IPC.chatPanelChanged, listener)
     return () => ipcRenderer.removeListener(IPC.chatPanelChanged, listener)
   },
+  setAutospeak: (enabled: boolean) => ipcRenderer.send(IPC.ttsSetAutospeak, enabled),
 }
 
 contextBridge.exposeInMainWorld('companion', api)
